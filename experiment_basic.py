@@ -1,9 +1,10 @@
 """
 experiment_basic.py - Basic Bézier curve experiments
-Implements the core experiments comparing Settings A, B, and C
-Modified to display results in mean±std format
-Enhanced version with 5 experiments using different class combinations
-Fixed Setting B to efficiently select images from the same class
+Modified version with FIXED CLASSES to align with other experiments:
+- Uses fixed classes for each setting (same as multi_image and comprehensive)
+- Collects all available successful samples (no 5 experiments)
+- No separate test set (evaluates on training path only)
+- Maintains consistency with the experimental framework
 """
 
 import torch
@@ -39,6 +40,13 @@ set_random_seeds(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# FIXED CLASS CONFIGURATION (same as other experiments)
+FIXED_CLASSES = {
+    'setting_A': 3,        # cat (single class)
+    'setting_B': 3,        # cat (same class)
+    'setting_C': (3, 5)    # cat and dog (two different classes)
+}
+
 def load_model():
     """Load pretrained ResNet-18 model"""
     model = resnet18(pretrained=False)
@@ -56,7 +64,7 @@ def load_model():
     
     return model.to(device).eval()
 
-def organize_images_by_class(dataloader, model, max_per_class=100):
+def organize_images_by_class(dataloader, model, max_per_class=200):
     """Organize images by class"""
     images_by_class = defaultdict(list)
     
@@ -129,15 +137,222 @@ def evaluate_bezier_path(model, bezier_obj, delta1, theta, delta2, x1, x2, y1, y
         'success_rate_avg': (success_x1 + success_x2) / (2 * num_points)
     }
 
-def print_comprehensive_results_table(results):
-    """Print results in mean±std format"""
+def collect_samples_setting_A(images_by_class, model, pgd_attack, bezier, norm, target_samples=25):
+    """Collect samples for Setting A (single image)"""
+    class_id = FIXED_CLASSES['setting_A']
+    
+    if class_id not in images_by_class:
+        print(f"    ERROR: Class {class_id} not available")
+        return []
+    
+    available_images = images_by_class[class_id]
+    print(f"    Setting A: Using class {class_id} with {len(available_images)} available images")
+    
+    samples = []
+    attempts = 0
+    max_attempts = min(len(available_images) * 10, 500)  # Reasonable limit
+    
+    pbar = tqdm(total=target_samples, desc=f"    Collecting Setting A samples")
+    
+    while len(samples) < target_samples and attempts < max_attempts:
+        # Select an image
+        img_idx = attempts % len(available_images)
+        x = available_images[img_idx][0]
+        y = torch.tensor([class_id]).to(device)
+        
+        attempts += 1
+        
+        # Generate two perturbations for the same image
+        delta1 = pgd_attack.perturb(x, y)
+        delta2 = pgd_attack.perturb(x, y)
+        
+        # Verify both endpoints work
+        with torch.no_grad():
+            x_adv_d1 = torch.clamp(x + delta1, 0, 1)
+            x_adv_d2 = torch.clamp(x + delta2, 0, 1)
+            pred_d1 = model(normalize_cifar10(x_adv_d1)).argmax(dim=1)
+            pred_d2 = model(normalize_cifar10(x_adv_d2)).argmax(dim=1)
+            
+            if pred_d1 == y or pred_d2 == y:
+                continue
+        
+        # Optimize Bézier path
+        theta, _, _, theta_norms = bezier.optimize_setting_A(x, y, delta1, delta2)
+        
+        # Evaluate path
+        eval_results = evaluate_bezier_path(
+            model, bezier, delta1, theta, delta2, 
+            x, x, y, y, setting_type='A'
+        )
+        
+        samples.append({
+            'success_rate': eval_results['success_rate_avg'],
+            'detailed_results': eval_results,
+            'theta_norm': theta_norms[-1],
+            'image_idx': img_idx
+        })
+        
+        pbar.update(1)
+    
+    pbar.close()
+    print(f"    Collected {len(samples)} samples for Setting A (attempts: {attempts})")
+    
+    return samples
+
+def collect_samples_setting_B(images_by_class, model, pgd_attack, bezier, norm, target_samples=25):
+    """Collect samples for Setting B (same class)"""
+    class_id = FIXED_CLASSES['setting_B']
+    
+    if class_id not in images_by_class:
+        print(f"    ERROR: Class {class_id} not available")
+        return []
+    
+    available_images = images_by_class[class_id]
+    print(f"    Setting B: Using class {class_id} with {len(available_images)} available images")
+    
+    if len(available_images) < 2:
+        print(f"    ERROR: Need at least 2 images for Setting B")
+        return []
+    
+    samples = []
+    attempts = 0
+    max_attempts = min(len(available_images) * len(available_images), 500)
+    
+    pbar = tqdm(total=target_samples, desc=f"    Collecting Setting B samples")
+    
+    while len(samples) < target_samples and attempts < max_attempts:
+        # Select two different images from the same class
+        idx1 = attempts % len(available_images)
+        idx2 = (attempts + 1 + (attempts // len(available_images))) % len(available_images)
+        
+        if idx1 == idx2:
+            idx2 = (idx2 + 1) % len(available_images)
+        
+        x1 = available_images[idx1][0]
+        x2 = available_images[idx2][0]
+        y = torch.tensor([class_id]).to(device)
+        
+        attempts += 1
+        
+        # Generate perturbations for each image
+        delta1 = pgd_attack.perturb(x1, y)
+        delta2 = pgd_attack.perturb(x2, y)
+        
+        # Verify endpoints work
+        with torch.no_grad():
+            pred1 = model(normalize_cifar10(torch.clamp(x1 + delta1, 0, 1))).argmax(1)
+            pred2 = model(normalize_cifar10(torch.clamp(x2 + delta2, 0, 1))).argmax(1)
+            
+            if pred1 == y or pred2 == y:
+                continue
+        
+        # Optimize Bézier path
+        theta, _, _, theta_norms = bezier.optimize_setting_B(x1, x2, y, delta1, delta2)
+        
+        # Evaluate path
+        eval_results = evaluate_bezier_path(
+            model, bezier, delta1, theta, delta2, 
+            x1, x2, y, y, setting_type='B'
+        )
+        
+        samples.append({
+            'success_rate': eval_results['success_rate_both'],
+            'detailed_results': eval_results,
+            'theta_norm': theta_norms[-1],
+            'image_indices': (idx1, idx2)
+        })
+        
+        pbar.update(1)
+    
+    pbar.close()
+    print(f"    Collected {len(samples)} samples for Setting B (attempts: {attempts})")
+    
+    return samples
+
+def collect_samples_setting_C(images_by_class, model, pgd_attack, bezier, norm, target_samples=25):
+    """Collect samples for Setting C (different classes)"""
+    class_id1, class_id2 = FIXED_CLASSES['setting_C']
+    
+    if class_id1 not in images_by_class or class_id2 not in images_by_class:
+        print(f"    ERROR: Classes {class_id1} or {class_id2} not available")
+        return []
+    
+    available_images1 = images_by_class[class_id1]
+    available_images2 = images_by_class[class_id2]
+    print(f"    Setting C: Using classes {class_id1} ({len(available_images1)} images) "
+          f"and {class_id2} ({len(available_images2)} images)")
+    
+    samples = []
+    attempts = 0
+    max_attempts = min(len(available_images1) * len(available_images2), 500)
+    
+    pbar = tqdm(total=target_samples, desc=f"    Collecting Setting C samples")
+    
+    while len(samples) < target_samples and attempts < max_attempts:
+        # Select one image from each class
+        idx1 = attempts % len(available_images1)
+        idx2 = attempts % len(available_images2)
+        
+        x1 = available_images1[idx1][0]
+        x2 = available_images2[idx2][0]
+        y1 = torch.tensor([class_id1]).to(device)
+        y2 = torch.tensor([class_id2]).to(device)
+        
+        attempts += 1
+        
+        # Generate perturbations for each image
+        delta1 = pgd_attack.perturb(x1, y1)
+        delta2 = pgd_attack.perturb(x2, y2)
+        
+        # Verify endpoints work
+        with torch.no_grad():
+            pred1 = model(normalize_cifar10(torch.clamp(x1 + delta1, 0, 1))).argmax(1)
+            pred2 = model(normalize_cifar10(torch.clamp(x2 + delta2, 0, 1))).argmax(1)
+            
+            if pred1 == y1 or pred2 == y2:
+                continue
+        
+        # Optimize Bézier path
+        theta, _, _, theta_norms = bezier.optimize_setting_C(x1, x2, y1, y2, delta1, delta2)
+        
+        # Evaluate path
+        eval_results = evaluate_bezier_path(
+            model, bezier, delta1, theta, delta2, 
+            x1, x2, y1, y2, setting_type='C'
+        )
+        
+        samples.append({
+            'success_rate': eval_results['success_rate_both'],
+            'detailed_results': eval_results,
+            'theta_norm': theta_norms[-1],
+            'image_indices': (idx1, idx2)
+        })
+        
+        pbar.update(1)
+    
+    pbar.close()
+    print(f"    Collected {len(samples)} samples for Setting C (attempts: {attempts})")
+    
+    return samples
+
+def print_results_fixed(results):
+    """Print results in fixed class format"""
     print("\n" + "="*120)
-    print("BASIC EXPERIMENTS - COMPREHENSIVE RESULTS (mean ± std)")
+    print("BASIC EXPERIMENTS - FIXED CLASSES RESULTS")
     print("="*120)
+    
+    # Print configuration
+    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                   'dog', 'frog', 'horse', 'ship', 'truck']
+    print("\nFixed Configuration:")
+    print(f"  Setting A: Class {FIXED_CLASSES['setting_A']} ({class_names[FIXED_CLASSES['setting_A']]})")
+    print(f"  Setting B: Class {FIXED_CLASSES['setting_B']} ({class_names[FIXED_CLASSES['setting_B']]})")
+    c1, c2 = FIXED_CLASSES['setting_C']
+    print(f"  Setting C: Classes {c1} ({class_names[c1]}) and {c2} ({class_names[c2]})")
     
     # Detailed results for each norm and setting
     for norm in ['linf', 'l2', 'l1']:
-        if not any(norm in results[setting] for setting in ['setting_A', 'setting_B', 'setting_C']):
+        if norm not in results:
             continue
             
         print(f"\n{'='*100}")
@@ -145,7 +360,7 @@ def print_comprehensive_results_table(results):
         print(f"{'='*100}")
         
         for setting in ['setting_A', 'setting_B', 'setting_C']:
-            if norm not in results[setting]:
+            if setting not in results[norm]:
                 continue
                 
             setting_name = {
@@ -155,58 +370,56 @@ def print_comprehensive_results_table(results):
             }[setting]
             
             print(f"\n{setting_name}:")
-            data = results[setting][norm]
+            samples = results[norm][setting]
             
-            if data['num_samples'] == 0:
-                print("  No valid samples collected")
+            if not samples:
+                print("  No samples collected")
                 continue
             
-            # For Setting A
+            # Extract metrics
             if setting == 'setting_A':
-                success_rates = data['success_rates']
-                theta_norms = data['theta_norms']
+                success_rates = [s['success_rate'] for s in samples]
+                theta_norms = [s['theta_norm'] for s in samples]
                 
                 avg_success = np.mean(success_rates) * 100
                 std_success = np.std(success_rates) * 100
                 avg_theta = np.mean(theta_norms)
                 std_theta = np.std(theta_norms)
                 
-                print(f"  Number of samples:     {data['num_samples']}")
+                print(f"  Number of samples:     {len(samples)}")
                 print(f"  Path success rate:     {avg_success:>6.1f} ± {std_success:<5.1f}%")
                 print(f"  Control point θ/ε:     {avg_theta:>6.2f} ± {std_theta:<5.2f}")
             
-            # For Settings B and C
             else:
-                if data['detailed_results']:
-                    # Extract individual metrics
-                    x1_rates = [d['success_rate_x1'] for d in data['detailed_results']]
-                    x2_rates = [d['success_rate_x2'] for d in data['detailed_results']]
-                    both_rates = [d['success_rate_both'] for d in data['detailed_results']]
-                    avg_rates = [d['success_rate_avg'] for d in data['detailed_results']]
-                    theta_norms = data['theta_norms']
-                    
-                    # Calculate statistics
-                    avg_x1 = np.mean(x1_rates) * 100
-                    std_x1 = np.std(x1_rates) * 100
-                    avg_x2 = np.mean(x2_rates) * 100
-                    std_x2 = np.std(x2_rates) * 100
-                    avg_both = np.mean(both_rates) * 100
-                    std_both = np.std(both_rates) * 100
-                    avg_avg = np.mean(avg_rates) * 100
-                    std_avg = np.std(avg_rates) * 100
-                    avg_theta = np.mean(theta_norms)
-                    std_theta = np.std(theta_norms)
-                    
-                    print(f"  Number of samples:     {data['num_samples']}")
-                    print(f"  Image 1 success rate:  {avg_x1:>6.1f} ± {std_x1:<5.1f}%")
-                    print(f"  Image 2 success rate:  {avg_x2:>6.1f} ± {std_x2:<5.1f}%")
-                    print(f"  Both images success:   {avg_both:>6.1f} ± {std_both:<5.1f}%")
-                    print(f"  Average success rate:  {avg_avg:>6.1f} ± {std_avg:<5.1f}%")
-                    print(f"  Control point θ/ε:     {avg_theta:>6.2f} ± {std_theta:<5.2f}")
+                # For Settings B and C
+                x1_rates = [s['detailed_results']['success_rate_x1'] for s in samples]
+                x2_rates = [s['detailed_results']['success_rate_x2'] for s in samples]
+                both_rates = [s['detailed_results']['success_rate_both'] for s in samples]
+                avg_rates = [s['detailed_results']['success_rate_avg'] for s in samples]
+                theta_norms = [s['theta_norm'] for s in samples]
+                
+                # Calculate statistics
+                avg_x1 = np.mean(x1_rates) * 100
+                std_x1 = np.std(x1_rates) * 100
+                avg_x2 = np.mean(x2_rates) * 100
+                std_x2 = np.std(x2_rates) * 100
+                avg_both = np.mean(both_rates) * 100
+                std_both = np.std(both_rates) * 100
+                avg_avg = np.mean(avg_rates) * 100
+                std_avg = np.std(avg_rates) * 100
+                avg_theta = np.mean(theta_norms)
+                std_theta = np.std(theta_norms)
+                
+                print(f"  Number of samples:     {len(samples)}")
+                print(f"  Image 1 success rate:  {avg_x1:>6.1f} ± {std_x1:<5.1f}%")
+                print(f"  Image 2 success rate:  {avg_x2:>6.1f} ± {std_x2:<5.1f}%")
+                print(f"  Both images success:   {avg_both:>6.1f} ± {std_both:<5.1f}%")
+                print(f"  Average success rate:  {avg_avg:>6.1f} ± {std_avg:<5.1f}%")
+                print(f"  Control point θ/ε:     {avg_theta:>6.2f} ± {std_theta:<5.2f}")
     
     # Summary table
     print("\n" + "="*120)
-    print("SUMMARY TABLE")
+    print("SUMMARY TABLE - FIXED CLASSES")
     print("="*120)
     print(f"\n{'Setting':<30} {'Norm':<8} {'Samples':<10} {'Img1':<18} {'Img2':<18} {'Both':<18} {'Average':<18}")
     print("-" * 110)
@@ -219,125 +432,57 @@ def print_comprehensive_results_table(results):
         }[setting]
         
         for norm in ['linf', 'l2', 'l1']:
-            if norm not in results[setting]:
+            if norm not in results or setting not in results[norm]:
                 continue
                 
             norm_symbol = {'linf': 'ℓ∞', 'l2': 'ℓ₂', 'l1': 'ℓ₁'}[norm]
-            data = results[setting][norm]
+            samples = results[norm][setting]
             
-            if data['num_samples'] == 0:
+            if not samples:
                 continue
             
             if setting == 'setting_A':
-                success_rates = data['success_rates']
+                success_rates = [s['success_rate'] for s in samples]
                 avg_success = np.mean(success_rates) * 100
                 std_success = np.std(success_rates) * 100
                 
-                print(f"{setting_display:<30} {norm_symbol:<8} {data['num_samples']:<10} "
+                print(f"{setting_display:<30} {norm_symbol:<8} {len(samples):<10} "
                       f"{'N/A':<18} {'N/A':<18} "
                       f"{'N/A':<18} {avg_success:>6.1f}±{std_success:<5.1f}%")
             else:
-                if data['detailed_results']:
-                    x1_rates = [d['success_rate_x1'] for d in data['detailed_results']]
-                    x2_rates = [d['success_rate_x2'] for d in data['detailed_results']]
-                    both_rates = [d['success_rate_both'] for d in data['detailed_results']]
-                    avg_rates = [d['success_rate_avg'] for d in data['detailed_results']]
-                    
-                    avg_x1 = np.mean(x1_rates) * 100
-                    std_x1 = np.std(x1_rates) * 100
-                    avg_x2 = np.mean(x2_rates) * 100
-                    std_x2 = np.std(x2_rates) * 100
-                    avg_both = np.mean(both_rates) * 100
-                    std_both = np.std(both_rates) * 100
-                    avg_avg = np.mean(avg_rates) * 100
-                    std_avg = np.std(avg_rates) * 100
-                    
-                    img1_str = f"{avg_x1:.1f}±{std_x1:.1f}%"
-                    img2_str = f"{avg_x2:.1f}±{std_x2:.1f}%"
-                    both_str = f"{avg_both:.1f}±{std_both:.1f}%"
-                    avg_str = f"{avg_avg:.1f}±{std_avg:.1f}%"
-                    
-                    print(f"{setting_display:<30} {norm_symbol:<8} {data['num_samples']:<10} "
-                          f"{img1_str:<18} {img2_str:<18} "
-                          f"{both_str:<18} {avg_str:<18}")
-    
-    print("\nLegend:")
-    print("• Img1 / Img2: Success rate on individual images")
-    print("• Both: Success rate when both images are fooled simultaneously")
-    print("• Average: Average success rate across images")
-    print("• Path evaluation excludes endpoints (t ∈ [0.02, 0.98])")
-
-def print_additional_insights(results):
-    """Print additional insights with statistical analysis"""
-    print("\n" + "="*120)
-    print("ADDITIONAL INSIGHTS")
-    print("="*120)
-    
-    # Compare norms with statistics
-    print("\n1. Norm Comparison (Average Success Rates):")
-    for setting in ['setting_A', 'setting_B', 'setting_C']:
-        setting_name = {
-            'setting_A': 'Setting A',
-            'setting_B': 'Setting B',
-            'setting_C': 'Setting C'
-        }[setting]
-        
-        print(f"\n   {setting_name}:")
-        norm_performances = []
-        
-        for norm in ['linf', 'l2', 'l1']:
-            if norm in results[setting] and results[setting][norm]['num_samples'] > 0:
-                if setting == 'setting_A':
-                    rates = results[setting][norm]['success_rates']
-                else:
-                    rates = [d['success_rate_avg'] for d in results[setting][norm]['detailed_results']]
+                x1_rates = [s['detailed_results']['success_rate_x1'] for s in samples]
+                x2_rates = [s['detailed_results']['success_rate_x2'] for s in samples]
+                both_rates = [s['detailed_results']['success_rate_both'] for s in samples]
+                avg_rates = [s['detailed_results']['success_rate_avg'] for s in samples]
                 
-                avg_rate = np.mean(rates) * 100
-                std_rate = np.std(rates) * 100
-                norm_performances.append((norm, avg_rate, std_rate))
-                print(f"   - {norm.upper()}: {avg_rate:.1f} ± {std_rate:.1f}%")
-        
-        if norm_performances:
-            best_norm = max(norm_performances, key=lambda x: x[1])
-            print(f"   → Best: {best_norm[0].upper()} ({best_norm[1]:.1f} ± {best_norm[2]:.1f}%)")
+                avg_x1 = np.mean(x1_rates) * 100
+                std_x1 = np.std(x1_rates) * 100
+                avg_x2 = np.mean(x2_rates) * 100
+                std_x2 = np.std(x2_rates) * 100
+                avg_both = np.mean(both_rates) * 100
+                std_both = np.std(both_rates) * 100
+                avg_avg = np.mean(avg_rates) * 100
+                std_avg = np.std(avg_rates) * 100
+                
+                img1_str = f"{avg_x1:.1f}±{std_x1:.1f}%"
+                img2_str = f"{avg_x2:.1f}±{std_x2:.1f}%"
+                both_str = f"{avg_both:.1f}±{std_both:.1f}%"
+                avg_str = f"{avg_avg:.1f}±{std_avg:.1f}%"
+                
+                print(f"{setting_display:<30} {norm_symbol:<8} {len(samples):<10} "
+                      f"{img1_str:<18} {img2_str:<18} "
+                      f"{both_str:<18} {avg_str:<18}")
     
-    # Theta norm analysis with statistics
-    print("\n2. Control Point (θ) Magnitude Analysis:")
-    for norm in ['linf', 'l2', 'l1']:
-        print(f"\n   {norm.upper()} norm:")
-        theta_data = []
-        
-        for setting in ['setting_A', 'setting_B', 'setting_C']:
-            if norm in results[setting] and results[setting][norm]['num_samples'] > 0:
-                theta_norms = results[setting][norm]['theta_norms']
-                avg_theta = np.mean(theta_norms)
-                std_theta = np.std(theta_norms)
-                setting_name = setting.replace('_', ' ').title()
-                theta_data.append((setting_name, avg_theta, std_theta))
-                print(f"   - {setting_name}: θ/ε = {avg_theta:.2f} ± {std_theta:.2f}")
-        
-        if theta_data:
-            avg_across_settings = np.mean([d[1] for d in theta_data])
-            print(f"   → Average across settings: {avg_across_settings:.2f}×ε")
-    
-    # Statistical summary
-    print("\n3. Statistical Summary:")
-    total_samples = 0
-    for setting in ['setting_A', 'setting_B', 'setting_C']:
-        for norm in ['linf', 'l2', 'l1']:
-            if norm in results[setting]:
-                total_samples += results[setting][norm]['num_samples']
-    
-    print(f"   Total samples collected: {total_samples}")
-    print(f"   Settings tested: A (Single Image), B (Same Class), C (Different Classes)")
-    print(f"   Norms evaluated: L∞, L₂, L₁")
-    print(f"   Path points sampled: 50 (excluding endpoints)")
-    print(f"   PGD attack iterations: 40")
-    print(f"   Number of experiments: 5 (with different class combinations)")
-    print(f"   Bézier optimization learning rate: 0.01")
+    print("\nExperimental Framework:")
+    print("• Fixed classes across all experiments for consistency")
+    print("• No separate test set (evaluates on training path)")
+    print("• Collects all available successful samples")
+    print("• Aligned with multi_image and comprehensive experiments")
 
-def run_single_experiment(experiment_id, images_by_class, model, num_samples_per_setting=25):
-    """Run a single experiment with specific class selections"""
+def run_basic_experiments_fixed():
+    """Run basic Bézier curve experiments with fixed classes"""
+    model = load_model()
+    
     norms = ['linf', 'l2', 'l1']
     epsilons = {
         'linf': 8/255,
@@ -345,7 +490,7 @@ def run_single_experiment(experiment_id, images_by_class, model, num_samples_per
         'l1': 10.0
     }
     
-    pgd_steps = 40  # Changed from 20 to 40
+    pgd_steps = 40
     
     # Community standard alpha factors for 40-step PGD
     pgd_alpha_factors = {
@@ -354,274 +499,6 @@ def run_single_experiment(experiment_id, images_by_class, model, num_samples_per
         'l1': 10.0      # α = ε/10 (stable optimization)
     }
     
-    results = {
-        'setting_A': {},
-        'setting_B': {},
-        'setting_C': {}
-    }
-    
-    # Get class IDs
-    class_ids = list(images_by_class.keys())
-    
-    # Rotate class selection based on experiment_id to ensure different combinations
-    class_offset = experiment_id * 2
-    
-    print(f"\n  Experiment {experiment_id + 1}/5 - Using class offset {class_offset}")
-    
-    for norm in norms:
-        print(f"\n  Testing {norm.upper()} norm (ε={epsilons[norm]})...")
-        
-        eps = epsilons[norm]
-        alpha = eps / pgd_alpha_factors[norm]  # Use community standard formula
-        
-        pgd_attack = PGDAttack(model, eps=eps, alpha=alpha, 
-                              num_iter=pgd_steps, norm=norm)
-        
-        bezier = BezierAdversarialUnconstrained(model, norm=norm, eps=eps, 
-                                               lr=0.01, num_iter=30)  # lr=0.01
-        
-        # Initialize results for this norm
-        for setting in ['setting_A', 'setting_B', 'setting_C']:
-            results[setting][norm] = {
-                'success_rates': [],
-                'detailed_results': [],
-                'theta_norms': [],
-                'num_samples': 0,
-                'avg_success_rate': 0,
-                'avg_theta_norm': 0
-            }
-        
-        samples_A = 0
-        samples_B = 0
-        samples_C = 0
-        
-        pbar = tqdm(total=num_samples_per_setting * 3, 
-                   desc=f"  Exp{experiment_id+1} {norm}")
-        
-        attempt_count = 0
-        max_attempts = 1000  # Prevent infinite loop
-        
-        while (samples_A < num_samples_per_setting or 
-               samples_B < num_samples_per_setting or 
-               samples_C < num_samples_per_setting) and attempt_count < max_attempts:
-            
-            attempt_count += 1
-            
-            # Setting A: Single Image
-            if samples_A < num_samples_per_setting:
-                # Choose a class for Setting A
-                class_a = class_ids[(attempt_count + class_offset) % len(class_ids)]
-                
-                if len(images_by_class[class_a]) >= 1:
-                    # Select one image
-                    img_idx = attempt_count % len(images_by_class[class_a])
-                    x = images_by_class[class_a][img_idx][0]
-                    y = torch.tensor([class_a]).to(device)
-                    
-                    # Verify clean accuracy
-                    with torch.no_grad():
-                        pred = model(normalize_cifar10(x)).argmax(dim=1)
-                        if pred != y:
-                            continue
-                    
-                    # Generate two perturbations for the same image
-                    delta1_A = pgd_attack.perturb(x, y)
-                    delta2_A = pgd_attack.perturb(x, y)
-                    
-                    # Verify both endpoints work
-                    with torch.no_grad():
-                        x_adv_d1 = torch.clamp(x + delta1_A, 0, 1)
-                        x_adv_d2 = torch.clamp(x + delta2_A, 0, 1)
-                        pred_d1 = model(normalize_cifar10(x_adv_d1)).argmax(dim=1)
-                        pred_d2 = model(normalize_cifar10(x_adv_d2)).argmax(dim=1)
-                        
-                        if pred_d1 == y or pred_d2 == y:
-                            continue
-                    
-                    # Optimize Bézier path
-                    theta_A, _, _, theta_norms = bezier.optimize_setting_A(x, y, delta1_A, delta2_A)
-                    
-                    # Evaluate path
-                    eval_results = evaluate_bezier_path(
-                        model, bezier, delta1_A, theta_A, delta2_A, 
-                        x, x, y, y, setting_type='A'
-                    )
-                    
-                    results['setting_A'][norm]['success_rates'].append(eval_results['success_rate_avg'])
-                    results['setting_A'][norm]['detailed_results'].append(eval_results)
-                    results['setting_A'][norm]['theta_norms'].append(theta_norms[-1])
-                    samples_A += 1
-                    pbar.update(1)
-            
-            # Setting B: Same Class - FIXED LOGIC
-            if samples_B < num_samples_per_setting:
-                # Choose a class for Setting B
-                class_b = class_ids[(attempt_count + class_offset + 1) % len(class_ids)]
-                
-                if len(images_by_class[class_b]) >= 2:
-                    # Select two different images from the same class
-                    img1_idx = (attempt_count * 2) % len(images_by_class[class_b])
-                    img2_idx = (attempt_count * 2 + 1) % len(images_by_class[class_b])
-                    
-                    # Ensure different images
-                    if img1_idx == img2_idx:
-                        img2_idx = (img2_idx + 1) % len(images_by_class[class_b])
-                    
-                    x1 = images_by_class[class_b][img1_idx][0]
-                    x2 = images_by_class[class_b][img2_idx][0]
-                    y = torch.tensor([class_b]).to(device)
-                    
-                    # Verify clean accuracy
-                    with torch.no_grad():
-                        pred1 = model(normalize_cifar10(x1)).argmax(dim=1)
-                        pred2 = model(normalize_cifar10(x2)).argmax(dim=1)
-                        
-                        if pred1 != y or pred2 != y:
-                            continue
-                    
-                    # Generate perturbations for each image
-                    delta1 = pgd_attack.perturb(x1, y)
-                    delta2 = pgd_attack.perturb(x2, y)
-                    
-                    # Verify endpoints work
-                    with torch.no_grad():
-                        pred1 = model(normalize_cifar10(torch.clamp(x1 + delta1, 0, 1))).argmax(1)
-                        pred2 = model(normalize_cifar10(torch.clamp(x2 + delta2, 0, 1))).argmax(1)
-                        
-                        if pred1 == y or pred2 == y:
-                            continue
-                    
-                    # Optimize Bézier path
-                    theta_B, _, _, theta_norms = bezier.optimize_setting_B(x1, x2, y, delta1, delta2)
-                    
-                    # Evaluate path
-                    eval_results = evaluate_bezier_path(
-                        model, bezier, delta1, theta_B, delta2, 
-                        x1, x2, y, y, setting_type='B'
-                    )
-                    
-                    results['setting_B'][norm]['success_rates'].append(eval_results['success_rate_both'])
-                    results['setting_B'][norm]['detailed_results'].append(eval_results)
-                    results['setting_B'][norm]['theta_norms'].append(theta_norms[-1])
-                    samples_B += 1
-                    pbar.update(1)
-            
-            # Setting C: Different Classes
-            if samples_C < num_samples_per_setting:
-                # Choose two different classes
-                class_c1 = class_ids[(attempt_count + class_offset) % len(class_ids)]
-                class_c2 = class_ids[(attempt_count + class_offset + 1) % len(class_ids)]
-                
-                if class_c1 != class_c2 and len(images_by_class[class_c1]) >= 1 and len(images_by_class[class_c2]) >= 1:
-                    # Select one image from each class
-                    img1_idx = attempt_count % len(images_by_class[class_c1])
-                    img2_idx = attempt_count % len(images_by_class[class_c2])
-                    
-                    x1 = images_by_class[class_c1][img1_idx][0]
-                    x2 = images_by_class[class_c2][img2_idx][0]
-                    y1 = torch.tensor([class_c1]).to(device)
-                    y2 = torch.tensor([class_c2]).to(device)
-                    
-                    # Verify clean accuracy
-                    with torch.no_grad():
-                        pred1 = model(normalize_cifar10(x1)).argmax(dim=1)
-                        pred2 = model(normalize_cifar10(x2)).argmax(dim=1)
-                        
-                        if pred1 != y1 or pred2 != y2:
-                            continue
-                    
-                    # Generate perturbations for each image
-                    delta1 = pgd_attack.perturb(x1, y1)
-                    delta2 = pgd_attack.perturb(x2, y2)
-                    
-                    # Verify endpoints work
-                    with torch.no_grad():
-                        pred1 = model(normalize_cifar10(torch.clamp(x1 + delta1, 0, 1))).argmax(1)
-                        pred2 = model(normalize_cifar10(torch.clamp(x2 + delta2, 0, 1))).argmax(1)
-                        
-                        if pred1 == y1 or pred2 == y2:
-                            continue
-                    
-                    # Optimize Bézier path
-                    theta_C, _, _, theta_norms = bezier.optimize_setting_C(x1, x2, y1, y2, delta1, delta2)
-                    
-                    # Evaluate path
-                    eval_results = evaluate_bezier_path(
-                        model, bezier, delta1, theta_C, delta2, 
-                        x1, x2, y1, y2, setting_type='C'
-                    )
-                    
-                    results['setting_C'][norm]['success_rates'].append(eval_results['success_rate_both'])
-                    results['setting_C'][norm]['detailed_results'].append(eval_results)
-                    results['setting_C'][norm]['theta_norms'].append(theta_norms[-1])
-                    samples_C += 1
-                    pbar.update(1)
-        
-        pbar.close()
-        
-        # Calculate averages
-        for setting in ['setting_A', 'setting_B', 'setting_C']:
-            if results[setting][norm]['success_rates']:
-                results[setting][norm]['avg_success_rate'] = \
-                    np.mean(results[setting][norm]['success_rates'])
-                results[setting][norm]['num_samples'] = \
-                    len(results[setting][norm]['success_rates'])
-                results[setting][norm]['avg_theta_norm'] = \
-                    np.mean(results[setting][norm]['theta_norms'])
-        
-        # Print progress summary
-        print(f"    Collected samples - A: {samples_A}, B: {samples_B}, C: {samples_C}")
-    
-    return results
-
-def aggregate_experiment_results(all_experiment_results):
-    """Aggregate results from multiple experiments"""
-    aggregated = {
-        'setting_A': {},
-        'setting_B': {},
-        'setting_C': {}
-    }
-    
-    norms = ['linf', 'l2', 'l1']
-    
-    for setting in ['setting_A', 'setting_B', 'setting_C']:
-        for norm in norms:
-            # Collect all results for this setting and norm
-            all_success_rates = []
-            all_detailed_results = []
-            all_theta_norms = []
-            
-            for exp_results in all_experiment_results:
-                if norm in exp_results[setting] and exp_results[setting][norm]['num_samples'] > 0:
-                    all_success_rates.extend(exp_results[setting][norm]['success_rates'])
-                    all_detailed_results.extend(exp_results[setting][norm]['detailed_results'])
-                    all_theta_norms.extend(exp_results[setting][norm]['theta_norms'])
-            
-            if all_success_rates:
-                aggregated[setting][norm] = {
-                    'success_rates': all_success_rates,
-                    'detailed_results': all_detailed_results,
-                    'theta_norms': all_theta_norms,
-                    'num_samples': len(all_success_rates),
-                    'avg_success_rate': np.mean(all_success_rates),
-                    'avg_theta_norm': np.mean(all_theta_norms)
-                }
-            else:
-                aggregated[setting][norm] = {
-                    'success_rates': [],
-                    'detailed_results': [],
-                    'theta_norms': [],
-                    'num_samples': 0,
-                    'avg_success_rate': 0,
-                    'avg_theta_norm': 0
-                }
-    
-    return aggregated
-
-def run_basic_experiments():
-    """Run basic Bézier curve experiments with 5 repetitions"""
-    model = load_model()
-    
     transform_test = transforms.Compose([transforms.ToTensor()])
     testset = torchvision.datasets.CIFAR10(
         root='./data', train=False, download=True, transform=transform_test)
@@ -629,83 +506,134 @@ def run_basic_experiments():
         testset, batch_size=1, shuffle=False, num_workers=2)
     
     print("\nOrganizing images by class...")
-    images_by_class = organize_images_by_class(testloader, model, max_per_class=100)
+    images_by_class = organize_images_by_class(testloader, model, max_per_class=200)
     
-    print(f"Found images for {len(images_by_class)} classes")
-    for class_id, images in images_by_class.items():
-        print(f"  Class {class_id}: {len(images)} images")
+    # Check availability of fixed classes
+    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                   'dog', 'frog', 'horse', 'ship', 'truck']
     
-    num_samples_per_setting = 25
-    num_experiments = 5
+    print("\nFixed class availability:")
+    required_classes = set([FIXED_CLASSES['setting_A'], FIXED_CLASSES['setting_B']] + 
+                           list(FIXED_CLASSES['setting_C']))
     
-    print("\nStarting experiments...")
-    print(f"Target: {num_samples_per_setting} samples per setting per norm")
-    print(f"Number of experiments: {num_experiments}")
-    print(f"PGD attack iterations: 40 (with community standard α = ε/4 for L∞)")
+    for class_id in required_classes:
+        if class_id in images_by_class:
+            print(f"  Class {class_id} ({class_names[class_id]}): {len(images_by_class[class_id])} images")
+        else:
+            print(f"  ERROR: Class {class_id} ({class_names[class_id]}) not available!")
+            return None
+    
+    target_samples = 25
+    print(f"\nTarget: {target_samples} samples per setting per norm")
+    print(f"PGD attack iterations: {pgd_steps} (with community standard α)")
     print(f"Bézier optimization: 30 iterations with lr=0.01")
     print("="*80)
     
-    all_experiment_results = []
+    all_results = {}
     
-    for exp_id in range(num_experiments):
+    for norm in norms:
         print(f"\n{'='*80}")
-        print(f"EXPERIMENT {exp_id + 1} / {num_experiments}")
+        print(f"Testing {norm.upper()} norm (ε={epsilons[norm]})")
         print(f"{'='*80}")
         
-        exp_results = run_single_experiment(exp_id, images_by_class, model, num_samples_per_setting)
-        all_experiment_results.append(exp_results)
+        eps = epsilons[norm]
+        alpha = eps / pgd_alpha_factors[norm]
+        
+        pgd_attack = PGDAttack(model, eps=eps, alpha=alpha, 
+                              num_iter=pgd_steps, norm=norm)
+        
+        bezier = BezierAdversarialUnconstrained(model, norm=norm, eps=eps, 
+                                               lr=0.01, num_iter=30)
+        
+        norm_results = {}
+        
+        # Setting A: Single Image
+        print(f"\n  Setting A (Single Image):")
+        samples_A = collect_samples_setting_A(images_by_class, model, pgd_attack, bezier, norm, target_samples)
+        norm_results['setting_A'] = samples_A
+        
+        # Setting B: Same Class
+        print(f"\n  Setting B (Same Class):")
+        samples_B = collect_samples_setting_B(images_by_class, model, pgd_attack, bezier, norm, target_samples)
+        norm_results['setting_B'] = samples_B
+        
+        # Setting C: Different Classes
+        print(f"\n  Setting C (Different Classes):")
+        samples_C = collect_samples_setting_C(images_by_class, model, pgd_attack, bezier, norm, target_samples)
+        norm_results['setting_C'] = samples_C
+        
+        all_results[norm] = norm_results
+        
+        # Print summary for this norm
+        print(f"\n  {norm.upper()} Summary:")
+        print(f"    Setting A: {len(samples_A)} samples collected")
+        print(f"    Setting B: {len(samples_B)} samples collected")
+        print(f"    Setting C: {len(samples_C)} samples collected")
     
-    # Aggregate results from all experiments
-    print("\nAggregating results from all experiments...")
-    aggregated_results = aggregate_experiment_results(all_experiment_results)
-    
-    return aggregated_results
+    return all_results
 
-def save_results(results):
+def save_results_fixed(results):
     """Save results to file"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f'bezier_basic_results_{timestamp}.json'
+    filename = f'bezier_basic_fixed_{timestamp}.json'
     
     # Convert to serializable format
     results_serializable = {}
-    for setting in results:
-        results_serializable[setting] = {}
-        for norm in results[setting]:
-            results_serializable[setting][norm] = {
-                'avg_success_rate': float(results[setting][norm]['avg_success_rate']),
-                'num_samples': int(results[setting][norm]['num_samples']),
-                'success_rates': [float(x) for x in results[setting][norm]['success_rates']],
-                'avg_theta_norm': float(results[setting][norm].get('avg_theta_norm', 0)),
-                'theta_norms': [float(x) for x in results[setting][norm]['theta_norms']],
-                'detailed_results': results[setting][norm]['detailed_results']
+    for norm in results:
+        results_serializable[norm] = {}
+        for setting in results[norm]:
+            samples_serializable = []
+            for sample in results[norm][setting]:
+                sample_dict = {
+                    'success_rate': float(sample['success_rate']),
+                    'theta_norm': float(sample['theta_norm']),
+                    'detailed_results': {
+                        k: float(v) for k, v in sample['detailed_results'].items()
+                    }
+                }
+                # Add indices information
+                if 'image_idx' in sample:
+                    sample_dict['image_idx'] = int(sample['image_idx'])
+                if 'image_indices' in sample:
+                    sample_dict['image_indices'] = [int(i) for i in sample['image_indices']]
+                samples_serializable.append(sample_dict)
+            
+            results_serializable[norm][setting] = samples_serializable
+    
+    # Add configuration information
+    results_with_config = {
+        'results': results_serializable,
+        'configuration': {
+            'fixed_classes': FIXED_CLASSES,
+            'target_samples': 25,
+            'pgd_iterations': 40,
+            'bezier_iterations': 30,
+            'pgd_alpha_factors': {
+                'linf': 4.0,
+                'l2': 5.0,
+                'l1': 10.0
             }
+        }
+    }
     
     with open(filename, 'w') as f:
-        json.dump(results_serializable, f, indent=4)
+        json.dump(results_with_config, f, indent=4)
     
     print(f"\nResults saved to {filename}")
     return filename
 
 if __name__ == "__main__":
-    print("Bézier Adversarial Curves - Basic Experiments")
+    print("Bézier Adversarial Curves - Basic Experiments (FIXED CLASSES)")
     print("="*80)
-    print("\nThree Experimental Settings:")
-    print("1. Setting A (Single Image)")
-    print("   • Generate two different adversarial perturbations for the same image")
-    print("   • Optimize the Bézier path connecting them")
-    print("\n2. Setting B (Same Class)")
-    print("   • Select two images from the same class")
-    print("   • Find a perturbation path effective for both images")
-    print("\n3. Setting C (Different Classes)")
-    print("   • Select two images from different classes")
-    print("   • Find a perturbation path effective for both images")
-    print("\nExperiment Configuration:")
-    print("   • 5 experiments with different class combinations")
-    print("   • 25 samples per setting per experiment")
-    print("   • PGD attack with 40 iterations")
-    print("   • Community standard α values: L∞=ε/4, L₂=ε/5, L₁=ε/10")
-    print("   • Bézier optimization: 30 iterations with lr=0.01")
-    print("   • Results displayed in mean ± std format")
+    print("\nKey Design (aligned with multi_image and comprehensive):")
+    print("• FIXED classes for all settings:")
+    print("  - Setting A: Class 3 (cat) - single image")
+    print("  - Setting B: Class 3 (cat) - same class pairs")
+    print("  - Setting C: Classes 3 & 5 (cat & dog) - different classes")
+    print("• Collect all available successful samples (target: 25 per setting)")
+    print("• No separate test set (evaluates on training path)")
+    print("• PGD attack with 40 iterations and community standard α")
+    print("• Bézier optimization: 30 iterations with lr=0.01")
     print("="*80)
     
     if not os.path.exists('resnet18_cifar10_best.pth'):
@@ -714,22 +642,20 @@ if __name__ == "__main__":
         exit(1)
     
     # Run experiments
-    results = run_basic_experiments()
+    results = run_basic_experiments_fixed()
     
-    # Print results
-    print_comprehensive_results_table(results)
-    print_additional_insights(results)
-    
-    # Save results
-    results_file = save_results(results)
-    
-    print(f"\nExperiments completed!")
-    print(f"Results saved to: {results_file}")
-    print("\nKey features:")
-    print("• Results displayed in mean ± std format")
-    print("• Comprehensive statistical analysis")
-    print("• Reproducible with random seed")
-    print("• 5 experiments × 25 samples per setting per norm")
-    print("• PGD attack with 40 iterations and community standard α values")
-    print("• Bézier optimization with learning rate 0.01")
-    print("• Fixed Setting B to efficiently select from same class")
+    if results:
+        # Print results
+        print_results_fixed(results)
+        
+        # Save results
+        results_file = save_results_fixed(results)
+        
+        print(f"\nExperiments completed!")
+        print(f"Results saved to: {results_file}")
+        
+        print("\nAlignment with other experiments:")
+        print("• Uses same fixed classes as multi_image and comprehensive")
+        print("• No test set separation (basic experiment evaluates on path only)")
+        print("• Consistent PGD parameters (40 iterations, community α)")
+        print("• Provides baseline for comparison with multi-image optimization")
