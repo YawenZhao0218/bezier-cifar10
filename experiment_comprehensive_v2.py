@@ -3,7 +3,11 @@ experiment_comprehensive_v2.py - Comprehensive parameter analysis
 Tests: (1) Convergence - how attack success changes with epochs (10/20/30/40/50)
        (2) Sampling density - how success changes with path points (50/100)
        (3) All settings (A,B,C) with 0,5,10,15,20,25 auxiliary images
-Modified version: 40 PGD iterations, community standard alpha, 5 experiments, reduced sampling points
+Modified version: FIXED CLASSES, VARIED MAIN IMAGES, DETERMINISTIC AUXILIARY SELECTION
+- Fixed classes for each setting
+- VARIED main images from training pool [130+] for each of 5 experiments
+- Deterministic auxiliary image selection (indices 0-24) - FIXED
+- Fixed test set (indices 30-129)
 """
 
 import torch
@@ -40,6 +44,13 @@ set_random_seeds(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}\n")
 
+# FIXED CLASS CONFIGURATION (same as transferability and multi_image)
+FIXED_CLASSES = {
+    'setting_A': 3,        # cat (single class)
+    'setting_B': 3,        # cat (same class)
+    'setting_C': (3, 5)    # cat and dog (two different classes)
+}
+
 def load_model():
     """Load pretrained ResNet-18"""
     model = resnet18(pretrained=False)
@@ -71,73 +82,187 @@ def organize_images_by_class(dataloader, model, max_per_class=300):
     
     return images_by_class
 
-def get_fixed_test_set_for_setting(images_by_class, setting, class_ids, num_test_images=100):
+def get_fixed_test_set_for_setting(images_by_class, setting):
     """
-    Get fixed test set for a specific setting
-    Reserve first 30 images for training (main + up to 25 auxiliary)
-    Use next num_test_images for testing
+    Get FIXED test set for each setting
+    Data layout:
+    [0-24]: Auxiliary image pool
+    [25-29]: Reserved
+    [30-129]: Test set (100 images)
+    [130+]: Training/Main image pool
     """
-    train_reserve = 30
+    test_start = 30
+    test_size = 100
     
     if setting == 'A' or setting == 'B':
-        class_id = class_ids[0]
+        class_id = FIXED_CLASSES[f'setting_{setting}']
         test_images = []
         test_labels = []
         
-        for i in range(train_reserve, min(train_reserve + num_test_images, len(images_by_class[class_id]))):
+        for i in range(test_start, min(test_start + test_size, len(images_by_class[class_id]))):
             test_images.append(images_by_class[class_id][i][0])
             test_labels.append(torch.tensor([class_id]).to(device))
         
         return test_images, test_labels
     
     elif setting == 'C':
-        class_id1, class_id2 = class_ids
+        class_id1, class_id2 = FIXED_CLASSES['setting_C']
         test_images = []
         test_labels = []
         
-        images_per_class = num_test_images // 2
-        
-        for i in range(train_reserve, min(train_reserve + images_per_class, len(images_by_class[class_id1]))):
+        # 50 images from each class
+        for i in range(test_start, min(test_start + 50, len(images_by_class[class_id1]))):
             test_images.append(images_by_class[class_id1][i][0])
             test_labels.append(torch.tensor([class_id1]).to(device))
         
-        for i in range(train_reserve, min(train_reserve + images_per_class, len(images_by_class[class_id2]))):
+        for i in range(test_start, min(test_start + 50, len(images_by_class[class_id2]))):
             test_images.append(images_by_class[class_id2][i][0])
             test_labels.append(torch.tensor([class_id2]).to(device))
         
         return test_images, test_labels
 
-def generate_valid_endpoints_setting_A(x_main, y_main, pgd_attack, model, max_attempts=50):
-    """Generate valid endpoints for Setting A (single image)"""
-    for attempt in range(max_attempts):
-        delta1 = pgd_attack.perturb(x_main, y_main)
-        delta2 = pgd_attack.perturb(x_main, y_main)
-        
-        with torch.no_grad():
-            x_adv_d1 = torch.clamp(x_main + delta1, 0, 1)
-            x_adv_d2 = torch.clamp(x_main + delta2, 0, 1)
-            pred_d1 = model(normalize_cifar10(x_adv_d1)).argmax(dim=1)
-            pred_d2 = model(normalize_cifar10(x_adv_d2)).argmax(dim=1)
-            
-            if pred_d1 != y_main and pred_d2 != y_main:
-                return delta1, delta2, True
+def get_auxiliary_images(images_by_class, setting, num_auxiliary):
+    """
+    Get auxiliary images deterministically from indices 0-24
+    Same logic as experiment_multi_image
+    """
+    if num_auxiliary == 0:
+        return [], []
     
-    return None, None, False
+    if setting == 'A' or setting == 'B':
+        class_id = FIXED_CLASSES[f'setting_{setting}']
+        aux_images = []
+        aux_labels = []
+        
+        # Deterministically select first num_auxiliary images
+        for idx in range(min(num_auxiliary, 25)):
+            if idx < len(images_by_class[class_id]):
+                aux_images.append(images_by_class[class_id][idx][0])
+                aux_labels.append(torch.tensor([class_id]).to(device))
+        
+        return aux_images, aux_labels
+    
+    elif setting == 'C':
+        class_id1, class_id2 = FIXED_CLASSES['setting_C']
+        aux_images = []
+        aux_labels = []
+        
+        num_from_class1 = (num_auxiliary + 1) // 2
+        num_from_class2 = num_auxiliary // 2
+        
+        # From first class
+        for idx in range(min(num_from_class1, 25)):
+            if idx < len(images_by_class[class_id1]):
+                aux_images.append(images_by_class[class_id1][idx][0])
+                aux_labels.append(torch.tensor([class_id1]).to(device))
+        
+        # From second class
+        for idx in range(min(num_from_class2, 25)):
+            if idx < len(images_by_class[class_id2]):
+                aux_images.append(images_by_class[class_id2][idx][0])
+                aux_labels.append(torch.tensor([class_id2]).to(device))
+        
+        return aux_images, aux_labels
 
-def generate_valid_endpoints_setting_BC(x1, x2, y1, y2, pgd_attack, model, max_attempts=50):
-    """Generate valid endpoints for Settings B and C"""
-    for attempt in range(max_attempts):
-        delta1 = pgd_attack.perturb(x1, y1)
-        delta2 = pgd_attack.perturb(x2, y2)
-        
-        with torch.no_grad():
-            pred1 = model(normalize_cifar10(torch.clamp(x1 + delta1, 0, 1))).argmax(1)
-            pred2 = model(normalize_cifar10(torch.clamp(x2 + delta2, 0, 1))).argmax(1)
-            
-            if pred1 != y1 and pred2 != y2:
-                return delta1, delta2, True
+def get_main_images_for_attempt(images_by_class, setting, attempt_id):
+    """
+    Get main images from training pool [130+] for each attempt
+    Note: attempt_id can be > 5 when retrying failed experiments
+    """
+    train_start = 130
     
-    return None, None, False
+    if setting == 'A':
+        class_id = FIXED_CLASSES['setting_A']
+        pool_size = len(images_by_class[class_id]) - train_start
+        if pool_size <= 0:
+            raise ValueError(f"Not enough images in training pool for class {class_id}")
+        
+        # Cycle through the pool if attempt_id is large
+        idx = train_start + (attempt_id * 7) % pool_size  # Use prime number for better spread
+        
+        x_main = images_by_class[class_id][idx][0]
+        y_main = torch.tensor([class_id]).to(device)
+        return [x_main], [y_main], idx
+    
+    elif setting == 'B':
+        class_id = FIXED_CLASSES['setting_B']
+        pool_size = len(images_by_class[class_id]) - train_start
+        if pool_size < 2:
+            raise ValueError(f"Not enough images in training pool for class {class_id}")
+        
+        # Select different pairs for each attempt
+        base_idx = (attempt_id * 11) % (pool_size - 1)  # Prime number for spread
+        
+        idx1 = train_start + base_idx
+        idx2 = train_start + (base_idx + 1) % pool_size
+        
+        x1 = images_by_class[class_id][idx1][0]
+        x2 = images_by_class[class_id][idx2][0]
+        y = torch.tensor([class_id]).to(device)
+        return [x1, x2], [y, y], (idx1, idx2)
+    
+    elif setting == 'C':
+        class_id1, class_id2 = FIXED_CLASSES['setting_C']
+        pool_size1 = len(images_by_class[class_id1]) - train_start
+        pool_size2 = len(images_by_class[class_id2]) - train_start
+        
+        if pool_size1 <= 0 or pool_size2 <= 0:
+            raise ValueError(f"Not enough images in training pool")
+        
+        idx1 = train_start + (attempt_id * 7) % pool_size1
+        idx2 = train_start + (attempt_id * 11) % pool_size2
+        
+        x1 = images_by_class[class_id1][idx1][0]
+        x2 = images_by_class[class_id2][idx2][0]
+        y1 = torch.tensor([class_id1]).to(device)
+        y2 = torch.tensor([class_id2]).to(device)
+        return [x1, x2], [y1, y2], (idx1, idx2)
+
+def generate_valid_endpoints_with_retry(setting, images_by_class, attempt_id, pgd_attack, model, 
+                                       max_pgd_retries=5):
+    """
+    Try to generate valid endpoints with PGD retry on same image
+    Returns (main_images, main_labels, delta1, delta2, main_indices, success)
+    """
+    # Get main images for this attempt
+    main_images, main_labels, main_indices = get_main_images_for_attempt(
+        images_by_class, setting, attempt_id
+    )
+    
+    if setting == 'A':
+        x_main = main_images[0]
+        y_main = main_labels[0]
+        
+        # Try multiple PGD attempts on same image
+        for pgd_try in range(max_pgd_retries):
+            delta1 = pgd_attack.perturb(x_main, y_main)
+            delta2 = pgd_attack.perturb(x_main, y_main)
+            
+            with torch.no_grad():
+                pred1 = model(normalize_cifar10(torch.clamp(x_main + delta1, 0, 1))).argmax(dim=1)
+                pred2 = model(normalize_cifar10(torch.clamp(x_main + delta2, 0, 1))).argmax(dim=1)
+                
+                if pred1 != y_main and pred2 != y_main:
+                    return main_images, main_labels, delta1, delta2, main_indices, True
+        
+        return main_images, main_labels, None, None, main_indices, False
+    
+    elif setting in ['B', 'C']:
+        x1, x2 = main_images
+        y1, y2 = main_labels
+        
+        for pgd_try in range(max_pgd_retries):
+            delta1 = pgd_attack.perturb(x1, y1)
+            delta2 = pgd_attack.perturb(x2, y2)
+            
+            with torch.no_grad():
+                pred1 = model(normalize_cifar10(torch.clamp(x1 + delta1, 0, 1))).argmax(1)
+                pred2 = model(normalize_cifar10(torch.clamp(x2 + delta2, 0, 1))).argmax(1)
+                
+                if pred1 != y1 and pred2 != y2:
+                    return main_images, main_labels, delta1, delta2, main_indices, True
+        
+        return main_images, main_labels, None, None, main_indices, False
 
 class BezierComprehensive(BezierAdversarialMultiImage):
     """Extended Bezier class for comprehensive evaluation"""
@@ -145,13 +270,12 @@ class BezierComprehensive(BezierAdversarialMultiImage):
     def optimize_and_evaluate_comprehensive(self, main_images, main_labels, aux_images, aux_labels,
                                           delta1, delta2, test_images, test_labels,
                                           epochs_list=[10, 20, 30, 40, 50],
-                                          path_points_list=[50, 100]):  # Modified: removed 25, 75
+                                          path_points_list=[50, 100]):
         """
         Optimize and evaluate with different epochs and path sampling
         Corrected metrics:
         - Convergence: proportion of test images that can be attacked
         - Sampling density: average number of images each point can attack
-        Modified: path_points_list now only includes 50 and 100
         """
         # Training images
         train_images = main_images + aux_images
@@ -279,19 +403,33 @@ class BezierComprehensive(BezierAdversarialMultiImage):
         return results
 
 def run_comprehensive_experiments_extended():
-    """Run comprehensive experiments with extended auxiliary images"""
+    """Run comprehensive experiments with FIXED classes and VARIED main images"""
     set_random_seeds(42)
     
     model = load_model()
     
     print("="*100)
-    print("COMPREHENSIVE EXPERIMENTS - MODIFIED VERSION")
+    print("COMPREHENSIVE EXPERIMENTS - VARIED MAIN IMAGES VERSION")
     print("Testing: (1) Epochs: 10/20/30/40/50")
-    print("         (2) Path points: 50/100 (reduced from 25/50/75/100)")
+    print("         (2) Path points: 50/100")
     print("         (3) Auxiliary images: 0,5,10,15,20,25")
-    print("         (4) 5 experiments per setting with averaging (increased from 3)")
-    print("         (5) PGD: 40 iterations with community standard α (aligned with experiment_basic)")
+    print("         (4) 5 experiments per setting with different main images")
+    print("         (5) PGD: 40 iterations with community standard α")
+    print("         (6) FIXED classes, VARIED main images, DETERMINISTIC auxiliary selection")
     print("="*100)
+    
+    # Print configuration
+    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                   'dog', 'frog', 'horse', 'ship', 'truck']
+    print("\nFixed Configuration:")
+    print(f"  Setting A: Class {FIXED_CLASSES['setting_A']} ({class_names[FIXED_CLASSES['setting_A']]})")
+    print(f"  Setting B: Class {FIXED_CLASSES['setting_B']} ({class_names[FIXED_CLASSES['setting_B']]})")
+    c1, c2 = FIXED_CLASSES['setting_C']
+    print(f"  Setting C: Classes {c1} ({class_names[c1]}) and {c2} ({class_names[c2]})")
+    print("\nData Layout:")
+    print("  [0-24]: Auxiliary images (FIXED across experiments)")
+    print("  [30-129]: Test set (100 images, FIXED)")
+    print("  [130+]: Main image pool (DIFFERENT for each experiment)")
     
     norms = ['linf', 'l2', 'l1']
     epsilons = {
@@ -303,10 +441,10 @@ def run_comprehensive_experiments_extended():
     # Extended auxiliary configurations
     auxiliary_configs = [0, 5, 10, 15, 20, 25]
     
-    # Modified: Use same parameters as experiment_basic.py
-    pgd_steps = 40  # Changed from 20 to 40
+    # Use same parameters as experiment_basic.py
+    pgd_steps = 40
     
-    # Community standard alpha factors for 40-step PGD (same as experiment_basic)
+    # Community standard alpha factors for 40-step PGD
     pgd_alpha_factors = {
         'linf': 4.0,    # α = ε/4 (community standard for 40 steps)
         'l2': 5.0,      # α = ε/5 (moderate attack)
@@ -321,19 +459,29 @@ def run_comprehensive_experiments_extended():
     
     print("\nOrganizing images by class...")
     images_by_class = organize_images_by_class(testloader, model, max_per_class=300)
-    print(f"Found images for {len(images_by_class)} classes")
     
-    num_test_images = 100
-    print(f"Using {num_test_images} images for testing")
-    print(f"Using auxiliary configurations: {auxiliary_configs}")
+    # Check availability of FIXED classes
+    required_classes = set([FIXED_CLASSES['setting_A'], FIXED_CLASSES['setting_B']] + 
+                           list(FIXED_CLASSES['setting_C']))
+    
+    print("\nFixed class availability:")
+    for class_id in required_classes:
+        if class_id in images_by_class:
+            print(f"  Class {class_id} ({class_names[class_id]}): {len(images_by_class[class_id])} images")
+            if len(images_by_class[class_id]) < 150:
+                print(f"    WARNING: Need at least 150 images for adequate training pool")
+        else:
+            print(f"  ERROR: Class {class_id} ({class_names[class_id]}) not available!")
+            return None
+    
+    print(f"\nUsing auxiliary configurations: {auxiliary_configs}")
     
     all_results = {
-        'generation_stats': {}
+        'generation_stats': {},
+        'main_image_indices': {}
     }
     
-    # Modified: Changed from 3 to 5 experiments
-    num_experiments = 5  # Changed from 3 to 5 (same as experiment_basic)
-    max_attempts_per_setting = 30
+    target_experiments = 5  # We want exactly 5 successful experiments
     
     for norm in norms:
         print(f"\n{'='*80}")
@@ -341,19 +489,25 @@ def run_comprehensive_experiments_extended():
         print(f"{'='*80}")
         
         eps = epsilons[norm]
-        
-        # Modified: Use community standard alpha values (same as experiment_basic)
         alpha = eps / pgd_alpha_factors[norm]
+        
+        # Adjust retry parameters based on norm difficulty
+        if norm == 'l1':
+            max_pgd_retries = 10
+            max_attempts = 30
+        else:
+            max_pgd_retries = 5
+            max_attempts = 15
         
         pgd_attack = PGDAttack(
             model, 
             eps=eps, 
             alpha=alpha,
-            num_iter=pgd_steps,  # 40 iterations
+            num_iter=pgd_steps,
             norm=norm
         )
         
-        bezier = BezierComprehensive(model, norm=norm, eps=eps)
+        bezier = BezierComprehensive(model, norm=norm, eps=eps, lr=0.01, num_iter=30)
         
         norm_results = {}
         generation_stats = {
@@ -362,60 +516,65 @@ def run_comprehensive_experiments_extended():
             'setting_C': {'attempted': 0, 'successful': 0}
         }
         
-        # Setting A: Single image
-        print("\n  Setting A (Single Image):")
-        setting_A_results = {num_aux: [] for num_aux in auxiliary_configs}
-        successful_runs_A = 0
-        attempt_count_A = 0
+        main_indices_used = {
+            'setting_A': [],
+            'setting_B': [],
+            'setting_C': []
+        }
         
-        while successful_runs_A < num_experiments and attempt_count_A < max_attempts_per_setting:
-            attempt_count_A += 1
+        # Setting A: Single image
+        print(f"\n  Setting A (Single Image, Class {FIXED_CLASSES['setting_A']}):")
+        setting_A_results = {num_aux: [] for num_aux in auxiliary_configs}
+        
+        # Get FIXED test set
+        test_images_A, test_labels_A = get_fixed_test_set_for_setting(images_by_class, 'A')
+        
+        successful_experiments = []
+        attempt_id = 0
+        
+        while len(successful_experiments) < target_experiments and attempt_id < max_attempts:
             generation_stats['setting_A']['attempted'] += 1
             
-            class_a = list(images_by_class.keys())[attempt_count_A % len(images_by_class)]
-            
-            required_images = 30 + num_test_images
-            if len(images_by_class[class_a]) < required_images:
-                continue
-            
-            x_main = images_by_class[class_a][0][0]
-            y_main = torch.tensor([class_a]).to(device)
-            
-            delta1, delta2, valid = generate_valid_endpoints_setting_A(
-                x_main, y_main, pgd_attack, model, max_attempts=50
+            # Try to generate valid endpoints with retry
+            main_images, main_labels, delta1, delta2, main_idx, success = generate_valid_endpoints_with_retry(
+                'A', images_by_class, attempt_id, pgd_attack, model, max_pgd_retries
             )
             
-            if not valid:
+            print(f"    Attempt {attempt_id+1}: Image index {main_idx} - {'Success' if success else 'Failed'}")
+            attempt_id += 1
+            
+            if not success:
                 continue
             
             generation_stats['setting_A']['successful'] += 1
-            successful_runs_A += 1
+            main_indices_used['setting_A'].append(main_idx)
             
-            test_images, test_labels = get_fixed_test_set_for_setting(
-                images_by_class, 'A', [class_a], num_test_images
-            )
+            # Store successful experiment data
+            successful_experiments.append({
+                'main_images': main_images,
+                'main_labels': main_labels,
+                'delta1': delta1,
+                'delta2': delta2,
+                'main_idx': main_idx
+            })
             
-            print(f"    Running experiment {successful_runs_A}/{num_experiments} for class {class_a}")
-            
+            print(f"      Collected {len(successful_experiments)}/{target_experiments} experiments")
+        
+        # Now run evaluation for all successful experiments
+        print(f"    Evaluating {len(successful_experiments)} successful experiments...")
+        
+        for exp_data in successful_experiments:
             for num_aux in auxiliary_configs:
-                if num_aux == 0:
-                    aux_images = []
-                    aux_labels = []
-                else:
-                    aux_images = []
-                    aux_labels = []
-                    for i in range(1, num_aux + 1):
-                        if i < len(images_by_class[class_a]):
-                            aux_images.append(images_by_class[class_a][i][0])
-                            aux_labels.append(torch.tensor([class_a]).to(device))
+                # Get DETERMINISTIC auxiliary images
+                aux_images, aux_labels = get_auxiliary_images(images_by_class, 'A', num_aux)
                 
                 results = bezier.optimize_and_evaluate_comprehensive(
-                    [x_main], [y_main],
+                    exp_data['main_images'], exp_data['main_labels'],
                     aux_images, aux_labels,
-                    delta1, delta2,
-                    test_images, test_labels,
+                    exp_data['delta1'], exp_data['delta2'],
+                    test_images_A, test_labels_A,
                     epochs_list=[10, 20, 30, 40, 50],
-                    path_points_list=[50, 100]  # Modified: reduced from [25, 50, 75, 100]
+                    path_points_list=[50, 100]
                 )
                 
                 setting_A_results[num_aux].append(results)
@@ -423,60 +582,54 @@ def run_comprehensive_experiments_extended():
         norm_results['setting_A'] = setting_A_results
         
         # Setting B: Same class
-        print("\n  Setting B (Same Class):")
+        print(f"\n  Setting B (Same Class, Class {FIXED_CLASSES['setting_B']}):")
         setting_B_results = {num_aux: [] for num_aux in auxiliary_configs}
-        successful_runs_B = 0
-        attempt_count_B = 0
         
-        while successful_runs_B < num_experiments and attempt_count_B < max_attempts_per_setting:
-            attempt_count_B += 1
+        # Get FIXED test set
+        test_images_B, test_labels_B = get_fixed_test_set_for_setting(images_by_class, 'B')
+        
+        successful_experiments = []
+        attempt_id = 0
+        
+        while len(successful_experiments) < target_experiments and attempt_id < max_attempts:
             generation_stats['setting_B']['attempted'] += 1
             
-            class_b = list(images_by_class.keys())[(attempt_count_B + 1) % len(images_by_class)]
-            
-            required_images = 30 + num_test_images
-            if len(images_by_class[class_b]) < required_images:
-                continue
-            
-            x1 = images_by_class[class_b][0][0]
-            x2 = images_by_class[class_b][1][0]
-            y = torch.tensor([class_b]).to(device)
-            
-            delta1, delta2, valid = generate_valid_endpoints_setting_BC(
-                x1, x2, y, y, pgd_attack, model, max_attempts=50
+            main_images, main_labels, delta1, delta2, main_indices, success = generate_valid_endpoints_with_retry(
+                'B', images_by_class, attempt_id, pgd_attack, model, max_pgd_retries
             )
             
-            if not valid:
+            print(f"    Attempt {attempt_id+1}: Image indices {main_indices} - {'Success' if success else 'Failed'}")
+            attempt_id += 1
+            
+            if not success:
                 continue
             
             generation_stats['setting_B']['successful'] += 1
-            successful_runs_B += 1
+            main_indices_used['setting_B'].append(main_indices)
             
-            test_images, test_labels = get_fixed_test_set_for_setting(
-                images_by_class, 'B', [class_b], num_test_images
-            )
+            successful_experiments.append({
+                'main_images': main_images,
+                'main_labels': main_labels,
+                'delta1': delta1,
+                'delta2': delta2,
+                'main_indices': main_indices
+            })
             
-            print(f"    Running experiment {successful_runs_B}/{num_experiments} for class {class_b}")
-            
+            print(f"      Collected {len(successful_experiments)}/{target_experiments} experiments")
+        
+        print(f"    Evaluating {len(successful_experiments)} successful experiments...")
+        
+        for exp_data in successful_experiments:
             for num_aux in auxiliary_configs:
-                if num_aux == 0:
-                    aux_images = []
-                    aux_labels = []
-                else:
-                    aux_images = []
-                    aux_labels = []
-                    for i in range(2, 2 + num_aux):
-                        if i < len(images_by_class[class_b]):
-                            aux_images.append(images_by_class[class_b][i][0])
-                            aux_labels.append(torch.tensor([class_b]).to(device))
+                aux_images, aux_labels = get_auxiliary_images(images_by_class, 'B', num_aux)
                 
                 results = bezier.optimize_and_evaluate_comprehensive(
-                    [x1, x2], [y, y],
+                    exp_data['main_images'], exp_data['main_labels'],
                     aux_images, aux_labels,
-                    delta1, delta2,
-                    test_images, test_labels,
+                    exp_data['delta1'], exp_data['delta2'],
+                    test_images_B, test_labels_B,
                     epochs_list=[10, 20, 30, 40, 50],
-                    path_points_list=[50, 100]  # Modified: reduced from [25, 50, 75, 100]
+                    path_points_list=[50, 100]
                 )
                 
                 setting_B_results[num_aux].append(results)
@@ -484,89 +637,70 @@ def run_comprehensive_experiments_extended():
         norm_results['setting_B'] = setting_B_results
         
         # Setting C: Different classes
-        print("\n  Setting C (Different Classes):")
+        class_c1, class_c2 = FIXED_CLASSES['setting_C']
+        print(f"\n  Setting C (Different Classes, Classes {class_c1} and {class_c2}):")
         setting_C_results = {num_aux: [] for num_aux in auxiliary_configs}
-        successful_runs_C = 0
-        attempt_count_C = 0
         
-        while successful_runs_C < num_experiments and attempt_count_C < max_attempts_per_setting:
-            attempt_count_C += 1
+        # Get FIXED test set
+        test_images_C, test_labels_C = get_fixed_test_set_for_setting(images_by_class, 'C')
+        
+        successful_experiments = []
+        attempt_id = 0
+        
+        while len(successful_experiments) < target_experiments and attempt_id < max_attempts:
             generation_stats['setting_C']['attempted'] += 1
             
-            class_ids = list(images_by_class.keys())
-            class_c1 = class_ids[(attempt_count_C + 2) % len(class_ids)]
-            class_c2 = class_ids[(attempt_count_C + 3) % len(class_ids)]
-            
-            if class_c1 == class_c2:
-                continue
-            
-            required_images_per_class = 30 + num_test_images // 2
-            if (len(images_by_class[class_c1]) < required_images_per_class or 
-                len(images_by_class[class_c2]) < required_images_per_class):
-                continue
-            
-            x1 = images_by_class[class_c1][0][0]
-            x2 = images_by_class[class_c2][0][0]
-            y1 = torch.tensor([class_c1]).to(device)
-            y2 = torch.tensor([class_c2]).to(device)
-            
-            delta1, delta2, valid = generate_valid_endpoints_setting_BC(
-                x1, x2, y1, y2, pgd_attack, model, max_attempts=50
+            main_images, main_labels, delta1, delta2, main_indices, success = generate_valid_endpoints_with_retry(
+                'C', images_by_class, attempt_id, pgd_attack, model, max_pgd_retries
             )
             
-            if not valid:
+            print(f"    Attempt {attempt_id+1}: Image indices {main_indices} - {'Success' if success else 'Failed'}")
+            attempt_id += 1
+            
+            if not success:
                 continue
             
             generation_stats['setting_C']['successful'] += 1
-            successful_runs_C += 1
+            main_indices_used['setting_C'].append(main_indices)
             
-            test_images, test_labels = get_fixed_test_set_for_setting(
-                images_by_class, 'C', [class_c1, class_c2], num_test_images
-            )
+            successful_experiments.append({
+                'main_images': main_images,
+                'main_labels': main_labels,
+                'delta1': delta1,
+                'delta2': delta2,
+                'main_indices': main_indices
+            })
             
-            print(f"    Running experiment {successful_runs_C}/{num_experiments} for classes {class_c1}, {class_c2}")
-            
+            print(f"      Collected {len(successful_experiments)}/{target_experiments} experiments")
+        
+        print(f"    Evaluating {len(successful_experiments)} successful experiments...")
+        
+        for exp_data in successful_experiments:
             for num_aux in auxiliary_configs:
-                if num_aux == 0:
-                    aux_images = []
-                    aux_labels = []
-                else:
-                    aux_images = []
-                    aux_labels = []
-                    
-                    num_from_class1 = (num_aux + 1) // 2
-                    num_from_class2 = num_aux // 2
-                    
-                    for i in range(1, 1 + num_from_class1):
-                        if i < len(images_by_class[class_c1]):
-                            aux_images.append(images_by_class[class_c1][i][0])
-                            aux_labels.append(torch.tensor([class_c1]).to(device))
-                    
-                    for i in range(1, 1 + num_from_class2):
-                        if i < len(images_by_class[class_c2]):
-                            aux_images.append(images_by_class[class_c2][i][0])
-                            aux_labels.append(torch.tensor([class_c2]).to(device))
+                aux_images, aux_labels = get_auxiliary_images(images_by_class, 'C', num_aux)
                 
                 results = bezier.optimize_and_evaluate_comprehensive(
-                    [x1, x2], [y1, y2],
+                    exp_data['main_images'], exp_data['main_labels'],
                     aux_images, aux_labels,
-                    delta1, delta2,
-                    test_images, test_labels,
+                    exp_data['delta1'], exp_data['delta2'],
+                    test_images_C, test_labels_C,
                     epochs_list=[10, 20, 30, 40, 50],
-                    path_points_list=[50, 100]  # Modified: reduced from [25, 50, 75, 100]
+                    path_points_list=[50, 100]
                 )
                 
                 setting_C_results[num_aux].append(results)
         
         norm_results['setting_C'] = setting_C_results
         
+        # Report statistics
+        print(f"\n  {norm.upper()} Summary:")
+        print(f"    Setting A: {generation_stats['setting_A']['successful']}/{generation_stats['setting_A']['attempted']} attempts successful")
+        print(f"    Setting B: {generation_stats['setting_B']['successful']}/{generation_stats['setting_B']['attempted']} attempts successful")
+        print(f"    Setting C: {generation_stats['setting_C']['successful']}/{generation_stats['setting_C']['attempted']} attempts successful")
+        
         all_results[norm] = norm_results
         all_results['generation_stats'][norm] = generation_stats
-        
-        print(f"\n  {norm.upper()} Summary:")
-        print(f"    Setting A: {successful_runs_A}/{num_experiments} successful runs")
-        print(f"    Setting B: {successful_runs_B}/{num_experiments} successful runs")
-        print(f"    Setting C: {successful_runs_C}/{num_experiments} successful runs")
+        all_results['main_image_indices'][norm] = main_indices_used
     
     return all_results
 
@@ -623,7 +757,7 @@ def aggregate_results_density(setting_results):
 def print_comprehensive_results_extended(all_results):
     """Print comprehensive results with corrected metrics"""
     print("\n" + "="*100)
-    print("COMPREHENSIVE RESULTS ANALYSIS (Modified: 50/100 points only, 5 experiments)")
+    print("COMPREHENSIVE RESULTS ANALYSIS (Varied Main Images Version)")
     print("="*100)
     
     for norm in ['linf', 'l2', 'l1']:
@@ -667,7 +801,6 @@ def print_comprehensive_results_extended(all_results):
                 print(row)
             
             # Sampling density analysis table - average images per point
-            # Modified: Only show 50 and 100 points
             print("\n2. SAMPLING DENSITY ANALYSIS (Average # of images each point can attack, using 50 epochs)")
             print("-" * 70)
             print(f"{'Aux Imgs':<10} {'50 points':<25} {'100 points':<25}")
@@ -683,7 +816,7 @@ def print_comprehensive_results_extended(all_results):
                     continue
                 
                 row = f"{num_aux:<10}"
-                for points in [50, 100]:  # Modified: only 50 and 100
+                for points in [50, 100]:
                     if points in aggregated[50]:
                         avg = aggregated[50][points]['avg_images_per_point']
                         std = aggregated[50][points]['std_images_per_point']
@@ -694,60 +827,90 @@ def print_comprehensive_results_extended(all_results):
     
     # Summary insights
     print("\n" + "="*100)
-    print("KEY INSIGHTS")
+    print("KEY INSIGHTS (VARIED MAIN IMAGES VERSION)")
     print("="*100)
     
-    print("\n1. AUXILIARY IMAGE IMPACT:")
+    print("\n1. EXPERIMENTAL DESIGN:")
+    print("   - Fixed classes eliminate class difficulty variance")
+    print("   - VARIED main images test generalization across different starting points")
+    print("   - Deterministic auxiliary selection ensures fair comparison")
+    print("   - Retry mechanism ensures 5 successful experiments per setting")
+    
+    print("\n2. AUXILIARY IMAGE IMPACT:")
     print("   - 0→5 images: First major improvement in attack success rate")
     print("   - 5→15 images: Continued gradual improvements")  
     print("   - 15→25 images: Diminishing returns observed")
     
-    print("\n2. CONVERGENCE PATTERNS:")
+    print("\n3. CONVERGENCE PATTERNS:")
     print("   - Early epochs (10-20): Rapid improvement in coverage")
     print("   - Middle epochs (20-30): Moderate gains")
     print("   - Late epochs (40-50): Plateau effect")
     
-    print("\n3. SAMPLING DENSITY EFFECTS (50 vs 100 points):")
+    print("\n4. SAMPLING DENSITY EFFECTS (50 vs 100 points):")
     print("   - 100 points provide better coverage than 50 points")
     print("   - Computational cost doubles from 50 to 100 points")
     print("   - Marginal improvement may not justify 2x computation in some cases")
+    
+    print("\n5. CONSISTENCY WITH OTHER EXPERIMENTS:")
+    print("   - Now aligns with multi_image experiment design")
+    print("   - Both use varied main images to test robustness")
+    print("   - Results show true auxiliary image effect across diverse starting points")
 
 if __name__ == "__main__":
-    print("Bézier Adversarial Curves - Comprehensive Analysis")
-    print("Modified version:")
-    print("- PGD: 40 iterations with community standard α (aligned with experiment_basic)")
-    print("- 5 experiments per setting (increased from 3)")
-    print("- Sampling density: 50 and 100 points only (reduced from 25/50/75/100)")
-    print("- 0,5,10,15,20,25 auxiliary images")
-    print("- Corrected metrics for convergence and sampling density")
+    print("Bézier Adversarial Curves - Comprehensive Analysis (VARIED MAIN IMAGES)")
+    print("="*80)
+    print("Key Design (aligned with multi_image experiment):")
+    print("- FIXED classes for all experiments")
+    print("- VARIED main images from [130+] pool (5 different images per setting)")
+    print("- FIXED auxiliary images from [0-24] (same across all experiments)")
+    print("- FIXED test set [30-129] (same as other experiments)")
+    print("- RETRY mechanism ensures exactly 5 successful experiments per setting")
     print("="*80)
     
     all_results = run_comprehensive_experiments_extended()
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f'bezier_comprehensive_modified_{timestamp}.json'
-    
-    def convert_numpy_types(obj):
-        if isinstance(obj, (np.float32, np.float64)):
-            return float(obj)
-        elif isinstance(obj, (np.int32, np.int64)):
-            return int(obj)
-        elif isinstance(obj, dict):
-            return {k: convert_numpy_types(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_numpy_types(v) for v in obj]
-        return obj
-    
-    with open(filename, 'w') as f:
-        json.dump(convert_numpy_types(all_results), f, indent=2)
-    
-    print(f"\nResults saved to {filename}")
-    
-    print_comprehensive_results_extended(all_results)
-    
-    print("\nExperiment complete!")
-    print("\nModifications summary:")
-    print("1. PGD: 40 iterations with α = ε/4 (L∞), ε/5 (L₂), ε/10 (L₁)")
-    print("2. 5 experiments per setting for better statistics")
-    print("3. Reduced sampling points to 50 and 100 only (faster execution)")
-    print("4. All other parameters remain unchanged")
+    if all_results:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f'bezier_comprehensive_varied_main_{timestamp}.json'
+        
+        # Save results with configuration
+        results_with_config = {
+            'results': all_results,
+            'configuration': {
+                'fixed_classes': FIXED_CLASSES,
+                'main_image_source': 'Training pool [130+], different for each experiment',
+                'auxiliary_pool': '[0-24] FIXED',
+                'test_set': '[30-129] FIXED',
+                'auxiliary_configs': [0, 5, 10, 15, 20, 25],
+                'epochs_list': [10, 20, 30, 40, 50],
+                'path_points_list': [50, 100],
+                'target_experiments': 5,
+                'pgd_iterations': 40,
+                'bezier_iterations': 30
+            }
+        }
+        
+        def convert_numpy_types(obj):
+            if isinstance(obj, (np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, (np.int32, np.int64)):
+                return int(obj)
+            elif isinstance(obj, dict):
+                return {k: convert_numpy_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(v) for v in obj]
+            return obj
+        
+        with open(filename, 'w') as f:
+            json.dump(convert_numpy_types(results_with_config), f, indent=2)
+        
+        print(f"\nResults saved to {filename}")
+        
+        print_comprehensive_results_extended(all_results)
+        
+        print("\nExperiment complete!")
+        print("\nExperimental Framework Summary:")
+        print("1. This experiment now uses VARIED main images like multi_image experiment")
+        print("2. Tests robustness of auxiliary image benefits across different starting points")
+        print("3. Retry mechanism handles difficult cases (especially L1 norm)")
+        print("4. Results show true auxiliary image effect with reduced overfitting risk")
