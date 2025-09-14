@@ -1,9 +1,11 @@
 """
 experiment_transferability.py - Test transferability on unseen images
-Modified to align with experiment_basic.py settings:
-- 40 PGD iterations with community standard alpha values
-- 5 experiments instead of 3
-Results displayed in mean±std format
+Community standard version with:
+- 25 different training samples/pairs (deterministic selection for reproducibility)
+- Each sample generates its own PGD endpoints
+- Fixed test set of 100 images for evaluation
+- Tracks average successful points per image
+- Aligned with experimental framework
 """
 
 import torch
@@ -21,7 +23,7 @@ import random
 from utils import PGDAttack, normalize_cifar10
 from bezier_core import BezierAdversarialUnconstrained
 
-# Set random seeds for reproducibility (same as multi_image)
+# Set random seeds for reproducibility
 def set_random_seeds(seed=42):
     """Set all random seeds for reproducibility"""
     torch.manual_seed(seed)
@@ -39,6 +41,13 @@ set_random_seeds(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# FIXED CLASS CONFIGURATION (for consistency with other experiments)
+FIXED_CLASSES = {
+    'setting_A': 3,        # cat (single class for Setting A)
+    'setting_B': 3,        # cat (same class for Setting B)  
+    'setting_C': (3, 5)    # cat and dog (two classes for Setting C)
+}
+
 def load_model():
     """Load pretrained ResNet-18"""
     model = resnet18(pretrained=False)
@@ -53,7 +62,7 @@ def load_model():
     return model.to(device).eval()
 
 def organize_images_by_class(dataloader, model, max_per_class=300):
-    """Organize images by class - increased to 300 same as multi_image"""
+    """Organize images by class"""
     images_by_class = defaultdict(list)
     
     for idx, (img, label) in enumerate(dataloader):
@@ -70,54 +79,87 @@ def organize_images_by_class(dataloader, model, max_per_class=300):
     
     return images_by_class
 
-def get_fixed_test_set_for_setting(images_by_class, setting, class_ids, num_test_images=100):
+def get_fixed_test_set_for_setting(images_by_class, setting):
     """
-    Get fixed test set - same as multi_image
-    Reserve first 30 images for training
-    Use next num_test_images for testing
+    Get FIXED test set for each setting
+    Data layout alignment:
+    [0-24]: Reserved for auxiliary (used in multi_image)
+    [25-29]: Reserved
+    [30-129]: Fixed test set (100 images)
+    [130+]: Training pool
     """
-    train_reserve = 30  # Same as multi_image
+    test_start = 30
+    test_size = 100
     
     if setting == 'A' or setting == 'B':
-        class_id = class_ids[0]
+        # Single class for settings A and B
+        class_id = FIXED_CLASSES[f'setting_{setting}']
         test_images = []
         test_labels = []
         
-        # Same indexing as multi_image
-        for i in range(train_reserve, min(train_reserve + num_test_images, len(images_by_class[class_id]))):
+        # Fixed test set: indices [30, 130)
+        for i in range(test_start, min(test_start + test_size, len(images_by_class[class_id]))):
             test_images.append(images_by_class[class_id][i][0])
             test_labels.append(torch.tensor([class_id]).to(device))
         
         return test_images, test_labels
     
     elif setting == 'C':
-        class_id1, class_id2 = class_ids
+        # Two classes for setting C
+        class_id1, class_id2 = FIXED_CLASSES['setting_C']
         test_images = []
         test_labels = []
         
-        images_per_class = num_test_images // 2
-        
-        for i in range(train_reserve, min(train_reserve + images_per_class, len(images_by_class[class_id1]))):
+        # 50 images from each class
+        for i in range(test_start, min(test_start + 50, len(images_by_class[class_id1]))):
             test_images.append(images_by_class[class_id1][i][0])
             test_labels.append(torch.tensor([class_id1]).to(device))
         
-        for i in range(train_reserve, min(train_reserve + images_per_class, len(images_by_class[class_id2]))):
+        for i in range(test_start, min(test_start + 50, len(images_by_class[class_id2]))):
             test_images.append(images_by_class[class_id2][i][0])
             test_labels.append(torch.tensor([class_id2]).to(device))
         
         return test_images, test_labels
 
+def get_training_pool_for_setting(images_by_class, setting):
+    """
+    Get training pool for each setting
+    Uses images from index 130 onwards (after test set)
+    """
+    train_start = 130
+    
+    if setting == 'A' or setting == 'B':
+        class_id = FIXED_CLASSES[f'setting_{setting}']
+        training_pool = []
+        
+        for i in range(train_start, len(images_by_class[class_id])):
+            training_pool.append((images_by_class[class_id][i][0], torch.tensor([class_id]).to(device)))
+        
+        return training_pool
+    
+    elif setting == 'C':
+        class_id1, class_id2 = FIXED_CLASSES['setting_C']
+        training_pool1 = []
+        training_pool2 = []
+        
+        for i in range(train_start, len(images_by_class[class_id1])):
+            training_pool1.append((images_by_class[class_id1][i][0], torch.tensor([class_id1]).to(device)))
+        
+        for i in range(train_start, len(images_by_class[class_id2])):
+            training_pool2.append((images_by_class[class_id2][i][0], torch.tensor([class_id2]).to(device)))
+        
+        return training_pool1, training_pool2
+
 def evaluate_transferability(model, bezier_obj, delta1, theta, delta2, 
                            transfer_images, transfer_labels, num_path_points=50):
-    """Evaluate transferability - fixed to 50 points same as multi_image"""
+    """Evaluate transferability - tracks successful points per image"""
     t_values = torch.linspace(0.01, 0.99, num_path_points).to(device)
     
     results = {
         'delta1_success': [],
         'delta2_success': [],
-        'path_success': [],
-        'best_path_success': [],
-        'any_path_success': []
+        'any_path_success': [],
+        'successful_points_per_image': []  # Added: track points per image
     }
     
     with torch.no_grad():
@@ -134,9 +176,8 @@ def evaluate_transferability(model, bezier_obj, delta1, theta, delta2,
             delta2_success = (pred != y).item()
             results['delta2_success'].append(delta2_success)
             
-            # Test path
+            # Test path - COUNT successful points
             path_success_count = 0
-            
             for t in t_values:
                 delta_t = bezier_obj.bezier_curve(delta1, theta, delta2, t)
                 delta_t = bezier_obj.project_norm_ball(delta_t)
@@ -147,66 +188,245 @@ def evaluate_transferability(model, bezier_obj, delta1, theta, delta2,
                 if pred != y:
                     path_success_count += 1
             
-            results['best_path_success'].append(path_success_count)
             results['any_path_success'].append(path_success_count > 0)
+            results['successful_points_per_image'].append(path_success_count)
     
     # Calculate statistics
     stats = {
         'delta1_transfer_rate': np.mean(results['delta1_success']),
         'delta2_transfer_rate': np.mean(results['delta2_success']),
-        'endpoints_avg_transfer_rate': np.mean(results['delta1_success'] + results['delta2_success']),
+        'endpoints_avg_transfer_rate': (np.mean(results['delta1_success']) + 
+                                        np.mean(results['delta2_success'])) / 2,
         'any_path_point_transfer_rate': np.mean(results['any_path_success']),
-        'avg_successful_path_points': np.mean(results['best_path_success']),
+        'avg_successful_points': np.mean(results['successful_points_per_image']),
+        'std_successful_points': np.std(results['successful_points_per_image']),
     }
     
-    # Find images "rescued" by path
-    rescued_by_path = []
+    # Calculate rescue rate
+    rescued = 0
     for i in range(len(transfer_images)):
         if not results['delta1_success'][i] and not results['delta2_success'][i] and results['any_path_success'][i]:
-            rescued_by_path.append(i)
+            rescued += 1
     
-    stats['rescued_by_path'] = rescued_by_path
-    stats['rescue_rate'] = len(rescued_by_path) / len(transfer_images) if len(transfer_images) > 0 else 0
+    stats['rescue_rate'] = rescued / len(transfer_images) if len(transfer_images) > 0 else 0
     
     return stats
 
-def generate_valid_endpoints_setting_A(x_main, y_main, pgd_attack, model, max_attempts=50):
-    """Generate valid endpoints for Setting A - same as multi_image"""
-    for attempt in range(max_attempts):
-        delta1 = pgd_attack.perturb(x_main, y_main)
-        delta2 = pgd_attack.perturb(x_main, y_main)
-        
-        with torch.no_grad():
-            x_adv_d1 = torch.clamp(x_main + delta1, 0, 1)
-            x_adv_d2 = torch.clamp(x_main + delta2, 0, 1)
-            pred_d1 = model(normalize_cifar10(x_adv_d1)).argmax(dim=1)
-            pred_d2 = model(normalize_cifar10(x_adv_d2)).argmax(dim=1)
-            
-            if pred_d1 != y_main and pred_d2 != y_main:
-                return delta1, delta2, True
+def collect_samples_setting_A(training_pool, model, pgd_attack, bezier, test_images, test_labels, 
+                              target_samples=25):
+    """Collect samples for Setting A using FIXED training samples for reproducibility"""
+    samples = []
     
-    return None, None, False
-
-def generate_valid_endpoints_setting_BC(x1, x2, y1, y2, pgd_attack, model, max_attempts=50):
-    """Generate valid endpoints for Settings B and C - same as multi_image"""
-    for attempt in range(max_attempts):
-        delta1 = pgd_attack.perturb(x1, y1)
-        delta2 = pgd_attack.perturb(x2, y2)
-        
-        with torch.no_grad():
-            pred1 = model(normalize_cifar10(torch.clamp(x1 + delta1, 0, 1))).argmax(1)
-            pred2 = model(normalize_cifar10(torch.clamp(x2 + delta2, 0, 1))).argmax(1)
-            
-            if pred1 != y1 and pred2 != y2:
-                return delta1, delta2, True
+    pbar = tqdm(total=target_samples, desc="    Collecting Setting A samples")
     
-    return None, None, False
+    # Use FIXED, deterministic indices for reproducibility
+    # Spread evenly across available training pool
+    step = max(1, len(training_pool) // target_samples)
+    
+    sample_count = 0
+    for i in range(min(target_samples * 2, len(training_pool))):  # Try more indices in case some fail
+        if sample_count >= target_samples:
+            break
+            
+        # FIXED index selection - same every run
+        idx = (i * step) % len(training_pool)
+        x_train, y_train = training_pool[idx]
+        
+        # Try to generate valid endpoints for this fixed training sample
+        max_pgd_attempts = 5
+        success = False
+        
+        for pgd_attempt in range(max_pgd_attempts):
+            # Generate two perturbations for this image
+            delta1 = pgd_attack.perturb(x_train, y_train)
+            delta2 = pgd_attack.perturb(x_train, y_train)
+            
+            # Verify endpoints work on training image
+            with torch.no_grad():
+                pred1 = model(normalize_cifar10(torch.clamp(x_train + delta1, 0, 1))).argmax(dim=1)
+                pred2 = model(normalize_cifar10(torch.clamp(x_train + delta2, 0, 1))).argmax(dim=1)
+                
+                if pred1 != y_train and pred2 != y_train:
+                    success = True
+                    break
+        
+        if not success:
+            continue
+        
+        # Optimize Bézier path
+        theta, _, _, _ = bezier.optimize_setting_A(x_train, y_train, delta1, delta2)
+        
+        # Evaluate transferability on test set
+        stats = evaluate_transferability(
+            model, bezier, delta1, theta, delta2,
+            test_images, test_labels
+        )
+        
+        samples.append({
+            'training_idx': idx,
+            'training_image_index': idx + 130,  # Actual index in dataset
+            'stats': stats
+        })
+        
+        sample_count += 1
+        pbar.update(1)
+    
+    pbar.close()
+    print(f"    Collected {len(samples)} samples using fixed training indices")
+    
+    return samples
 
-def print_transferability_summary(results):
-    """Print transferability summary with mean±std format"""
+def collect_samples_setting_B(training_pool, model, pgd_attack, bezier, test_images, test_labels,
+                              target_samples=25):
+    """Collect samples for Setting B using FIXED training pairs for reproducibility"""
+    samples = []
+    
+    pbar = tqdm(total=target_samples, desc="    Collecting Setting B samples")
+    
+    # Generate FIXED pairs of indices for reproducibility
+    # Use deterministic pairing: (0,1), (2,3), (4,5), etc.
+    sample_count = 0
+    for pair_idx in range(min(target_samples * 2, len(training_pool) // 2)):
+        if sample_count >= target_samples:
+            break
+            
+        # FIXED pair selection - same every run
+        idx1 = (pair_idx * 2) % len(training_pool)
+        idx2 = (pair_idx * 2 + 1) % len(training_pool)
+        
+        x1_train, y_train = training_pool[idx1]
+        x2_train, _ = training_pool[idx2]
+        
+        # Try to generate valid endpoints
+        max_pgd_attempts = 5
+        success = False
+        
+        for pgd_attempt in range(max_pgd_attempts):
+            # Generate perturbations
+            delta1 = pgd_attack.perturb(x1_train, y_train)
+            delta2 = pgd_attack.perturb(x2_train, y_train)
+            
+            # Verify endpoints work
+            with torch.no_grad():
+                pred1 = model(normalize_cifar10(torch.clamp(x1_train + delta1, 0, 1))).argmax(dim=1)
+                pred2 = model(normalize_cifar10(torch.clamp(x2_train + delta2, 0, 1))).argmax(dim=1)
+                
+                if pred1 != y_train and pred2 != y_train:
+                    success = True
+                    break
+        
+        if not success:
+            continue
+        
+        # Optimize Bézier path
+        theta, _, _, _ = bezier.optimize_setting_B(x1_train, x2_train, y_train, delta1, delta2)
+        
+        # Evaluate transferability
+        stats = evaluate_transferability(
+            model, bezier, delta1, theta, delta2,
+            test_images, test_labels
+        )
+        
+        samples.append({
+            'training_indices': (idx1, idx2),
+            'training_image_indices': (idx1 + 130, idx2 + 130),  # Actual indices in dataset
+            'stats': stats
+        })
+        
+        sample_count += 1
+        pbar.update(1)
+    
+    pbar.close()
+    print(f"    Collected {len(samples)} samples using fixed training pairs")
+    
+    return samples
+
+def collect_samples_setting_C(training_pool1, training_pool2, model, pgd_attack, bezier, 
+                              test_images, test_labels, target_samples=25):
+    """Collect samples for Setting C using FIXED training pairs for reproducibility"""
+    samples = []
+    
+    pbar = tqdm(total=target_samples, desc="    Collecting Setting C samples")
+    
+    # Generate FIXED cross-class pairs for reproducibility
+    # Use deterministic pairing: pool1[0] with pool2[0], pool1[1] with pool2[1], etc.
+    sample_count = 0
+    max_pairs = min(target_samples * 2, len(training_pool1), len(training_pool2))
+    
+    for pair_idx in range(max_pairs):
+        if sample_count >= target_samples:
+            break
+            
+        # FIXED pair selection - same every run
+        idx1 = pair_idx % len(training_pool1)
+        idx2 = pair_idx % len(training_pool2)
+        
+        x1_train, y1_train = training_pool1[idx1]
+        x2_train, y2_train = training_pool2[idx2]
+        
+        # Try to generate valid endpoints
+        max_pgd_attempts = 5
+        success = False
+        
+        for pgd_attempt in range(max_pgd_attempts):
+            # Generate perturbations
+            delta1 = pgd_attack.perturb(x1_train, y1_train)
+            delta2 = pgd_attack.perturb(x2_train, y2_train)
+            
+            # Verify endpoints work
+            with torch.no_grad():
+                pred1 = model(normalize_cifar10(torch.clamp(x1_train + delta1, 0, 1))).argmax(dim=1)
+                pred2 = model(normalize_cifar10(torch.clamp(x2_train + delta2, 0, 1))).argmax(dim=1)
+                
+                if pred1 != y1_train and pred2 != y2_train:
+                    success = True
+                    break
+        
+        if not success:
+            continue
+        
+        # Optimize Bézier path
+        theta, _, _, _ = bezier.optimize_setting_C(x1_train, x2_train, y1_train, y2_train, delta1, delta2)
+        
+        # Evaluate transferability
+        stats = evaluate_transferability(
+            model, bezier, delta1, theta, delta2,
+            test_images, test_labels
+        )
+        
+        samples.append({
+            'training_indices': (idx1, idx2),
+            'training_image_indices': (idx1 + 130, idx2 + 130),  # Actual indices in dataset
+            'stats': stats
+        })
+        
+        sample_count += 1
+        pbar.update(1)
+    
+    pbar.close()
+    print(f"    Collected {len(samples)} samples using fixed training pairs")
+    
+    return samples
+
+def print_transferability_results(results):
+    """Print transferability results in mean±std format"""
     print("\n" + "="*120)
-    print("TRANSFERABILITY EXPERIMENT RESULTS (mean ± std format)")
+    print("TRANSFERABILITY EXPERIMENT RESULTS (REPRODUCIBLE)")
     print("="*120)
+    
+    # Print configuration
+    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                   'dog', 'frog', 'horse', 'ship', 'truck']
+    print("\nExperimental Configuration:")
+    print(f"  Setting A: Class {FIXED_CLASSES['setting_A']} ({class_names[FIXED_CLASSES['setting_A']]})")
+    print(f"  Setting B: Class {FIXED_CLASSES['setting_B']} ({class_names[FIXED_CLASSES['setting_B']]})")
+    c1, c2 = FIXED_CLASSES['setting_C']
+    print(f"  Setting C: Classes {c1} ({class_names[c1]}) and {c2} ({class_names[c2]})")
+    print("\nData Layout:")
+    print("  [0-24]:   Reserved (auxiliary pool for multi_image)")
+    print("  [25-29]:  Reserved")
+    print("  [30-129]: Fixed test set (100 images)")
+    print("  [130+]:   Training pool")
     
     for norm in ['linf', 'l2', 'l1']:
         if norm not in results:
@@ -226,20 +446,19 @@ def print_transferability_summary(results):
             print(f"\n{setting_name}:")
             
             if not results[norm][setting]:
-                print("  No valid results obtained for this setting.")
+                print("  No samples collected")
                 continue
             
-            stats_list = results[norm][setting]
+            # Extract statistics from samples
+            samples = results[norm][setting]
+            delta1_rates = [s['stats']['delta1_transfer_rate'] for s in samples]
+            delta2_rates = [s['stats']['delta2_transfer_rate'] for s in samples]
+            endpoints_avg_rates = [s['stats']['endpoints_avg_transfer_rate'] for s in samples]
+            path_rates = [s['stats']['any_path_point_transfer_rate'] for s in samples]
+            rescue_rates = [s['stats']['rescue_rate'] for s in samples]
+            avg_points_list = [s['stats']['avg_successful_points'] for s in samples]
             
-            # Calculate mean and std for each metric
-            delta1_rates = [s['delta1_transfer_rate'] for s in stats_list]
-            delta2_rates = [s['delta2_transfer_rate'] for s in stats_list]
-            endpoints_avg_rates = [s['endpoints_avg_transfer_rate'] for s in stats_list]
-            any_path_rates = [s['any_path_point_transfer_rate'] for s in stats_list]
-            rescue_rates = [s['rescue_rate'] for s in stats_list]
-            successful_points = [s['avg_successful_path_points'] for s in stats_list]
-            
-            # Convert to percentages and calculate statistics
+            # Calculate mean and std
             avg_delta1 = np.mean(delta1_rates) * 100
             std_delta1 = np.std(delta1_rates) * 100
             
@@ -249,36 +468,36 @@ def print_transferability_summary(results):
             avg_endpoints = np.mean(endpoints_avg_rates) * 100
             std_endpoints = np.std(endpoints_avg_rates) * 100
             
-            avg_any_path = np.mean(any_path_rates) * 100
-            std_any_path = np.std(any_path_rates) * 100
+            avg_path = np.mean(path_rates) * 100
+            std_path = np.std(path_rates) * 100
             
             avg_rescue = np.mean(rescue_rates) * 100
             std_rescue = np.std(rescue_rates) * 100
             
-            avg_successful_points = np.mean(successful_points)
-            std_successful_points = np.std(successful_points)
+            avg_points = np.mean(avg_points_list)
+            std_points = np.std(avg_points_list)
             
-            improvement = avg_any_path - avg_endpoints
+            improvement = avg_path - avg_endpoints
             
-            # Print detailed statistics
-            print(f"  Endpoint δ₁ transfer rate:        {avg_delta1:>6.1f} ± {std_delta1:<5.1f}%")
-            print(f"  Endpoint δ₂ transfer rate:        {avg_delta2:>6.1f} ± {std_delta2:<5.1f}%")
-            print(f"  Endpoints average:                {avg_endpoints:>6.1f} ± {std_endpoints:<5.1f}%")
-            print(f"  Any path point succeeds:          {avg_any_path:>6.1f} ± {std_any_path:<5.1f}%")
-            print(f"  Images rescued by path:           {avg_rescue:>6.1f} ± {std_rescue:<5.1f}%")
-            print(f"  Avg successful path points/image: {avg_successful_points:>6.1f} ± {std_successful_points:<5.1f} / 50")
+            print(f"  Number of samples:           {len(samples)}")
+            print(f"  Endpoint δ₁ transfer:        {avg_delta1:>6.1f} ± {std_delta1:<5.1f}%")
+            print(f"  Endpoint δ₂ transfer:        {avg_delta2:>6.1f} ± {std_delta2:<5.1f}%")
+            print(f"  Endpoints average:           {avg_endpoints:>6.1f} ± {std_endpoints:<5.1f}%")
+            print(f"  Any path point succeeds:     {avg_path:>6.1f} ± {std_path:<5.1f}%")
+            print(f"  Avg successful points/image: {avg_points:>6.1f} ± {std_points:<5.1f} / 50")
+            print(f"  Images rescued by path:      {avg_rescue:>6.1f} ± {std_rescue:<5.1f}%")
             
             if improvement > 0:
-                print(f"  \033[92mImprovement over endpoints:       +{improvement:>5.1f}%\033[0m")
+                print(f"  \033[92mImprovement over endpoints:  +{improvement:>5.1f}%\033[0m")
             else:
-                print(f"  \033[91mImprovement over endpoints:       {improvement:>6.1f}%\033[0m")
+                print(f"  \033[91mImprovement over endpoints:  {improvement:>6.1f}%\033[0m")
     
-    # Print summary table
+    # Summary table with points metric
     print("\n" + "="*120)
     print("SUMMARY TABLE")
     print("="*120)
-    print(f"\n{'Setting':<30} {'Norm':<8} {'Endpoint Avg':<20} {'Path Success':<20} {'Improvement':<15}")
-    print("-" * 93)
+    print(f"\n{'Setting':<30} {'Norm':<8} {'Samples':<10} {'Endpoint Avg':<20} {'Path Success':<20} {'Avg Points':<15} {'Improvement':<15}")
+    print("-" * 118)
     
     for norm in ['linf', 'l2', 'l1']:
         if norm not in results:
@@ -287,35 +506,43 @@ def print_transferability_summary(results):
         
         for setting in ['setting_A', 'setting_B', 'setting_C']:
             setting_name = {
-                'setting_A': 'Setting A (Single Image)',
+                'setting_A': 'Setting A (Single)',
                 'setting_B': 'Setting B (Same Class)',
-                'setting_C': 'Setting C (Different Classes)'
+                'setting_C': 'Setting C (Diff Class)'
             }[setting]
             
             if results[norm][setting]:
-                stats_list = results[norm][setting]
+                samples = results[norm][setting]
                 
-                avg_endpoints = np.mean([s['endpoints_avg_transfer_rate'] for s in stats_list]) * 100
-                std_endpoints = np.std([s['endpoints_avg_transfer_rate'] for s in stats_list]) * 100
+                endpoints_avg_rates = [s['stats']['endpoints_avg_transfer_rate'] for s in samples]
+                path_rates = [s['stats']['any_path_point_transfer_rate'] for s in samples]
+                avg_points_list = [s['stats']['avg_successful_points'] for s in samples]
                 
-                avg_path = np.mean([s['any_path_point_transfer_rate'] for s in stats_list]) * 100
-                std_path = np.std([s['any_path_point_transfer_rate'] for s in stats_list]) * 100
+                avg_endpoints = np.mean(endpoints_avg_rates) * 100
+                std_endpoints = np.std(endpoints_avg_rates) * 100
+                
+                avg_path = np.mean(path_rates) * 100
+                std_path = np.std(path_rates) * 100
+                
+                avg_points = np.mean(avg_points_list)
+                std_points = np.std(avg_points_list)
                 
                 improvement = avg_path - avg_endpoints
                 
                 endpoints_str = f"{avg_endpoints:.1f}±{std_endpoints:.1f}%"
                 path_str = f"{avg_path:.1f}±{std_path:.1f}%"
+                points_str = f"{avg_points:.1f}±{std_points:.1f}"
                 
                 if improvement > 0:
                     imp_str = f"\033[92m+{improvement:.1f}%\033[0m"
                 else:
                     imp_str = f"\033[91m{improvement:.1f}%\033[0m"
                 
-                print(f"{setting_name:<30} {norm_symbol:<8} {endpoints_str:<20} {path_str:<20} {imp_str}")
+                print(f"{setting_name:<30} {norm_symbol:<8} {len(samples):<10} "
+                      f"{endpoints_str:<20} {path_str:<20} {points_str:<15} {imp_str}")
 
 def run_transferability_experiments():
-    """Run transferability experiments - aligned with experiment_basic settings"""
-    # Set random seeds again
+    """Run transferability experiments using reproducible approach"""
     set_random_seeds(42)
     
     norms = ['linf', 'l2', 'l1']
@@ -325,14 +552,11 @@ def run_transferability_experiments():
         'l1': 10.0
     }
     
-    # Modified: Use same parameters as experiment_basic.py
-    pgd_steps = 40  # Changed from 20 to 40
-    
-    # Community standard alpha factors for 40-step PGD (same as experiment_basic)
+    pgd_steps = 40
     pgd_alpha_factors = {
-        'linf': 4.0,    # α = ε/4 (community standard for 40 steps)
-        'l2': 5.0,      # α = ε/5 (moderate attack)
-        'l1': 10.0      # α = ε/10 (stable optimization)
+        'linf': 4.0,    # α = ε/4 (community standard)
+        'l2': 5.0,      # α = ε/5
+        'l1': 10.0      # α = ε/10
     }
     
     model = load_model()
@@ -343,262 +567,195 @@ def run_transferability_experiments():
     testloader = torch.utils.data.DataLoader(
         testset, batch_size=1, shuffle=False, num_workers=2)
     
-    print("Organizing images by class...")
+    print("\nOrganizing images by class...")
     images_by_class = organize_images_by_class(testloader, model, max_per_class=300)
     
-    # Check availability
-    print("\nImage availability per class:")
-    for class_id, images in images_by_class.items():
-        print(f"  Class {class_id}: {len(images)} images")
+    # Check class availability
+    print("\nClass availability:")
+    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                   'dog', 'frog', 'horse', 'ship', 'truck']
     
-    num_test_images = 100  # Same as multi_image
-    print(f"\nUsing {num_test_images} images for testing")
+    required_classes = set([FIXED_CLASSES['setting_A'], FIXED_CLASSES['setting_B']] + 
+                           list(FIXED_CLASSES['setting_C']))
     
-    all_results = {
-        'generation_stats': {}
+    for class_id in required_classes:
+        if class_id in images_by_class:
+            print(f"  Class {class_id} ({class_names[class_id]}): {len(images_by_class[class_id])} images")
+        else:
+            print(f"  ERROR: Class {class_id} ({class_names[class_id]}) not available!")
+            return None
+    
+    # Create fixed test sets
+    print("\nCreating fixed test sets...")
+    test_sets = {
+        'setting_A': get_fixed_test_set_for_setting(images_by_class, 'A'),
+        'setting_B': get_fixed_test_set_for_setting(images_by_class, 'B'),
+        'setting_C': get_fixed_test_set_for_setting(images_by_class, 'C')
     }
+    
+    for setting, (test_images, test_labels) in test_sets.items():
+        print(f"  {setting}: {len(test_images)} test images")
+    
+    # Create training pools
+    print("\nCreating training pools...")
+    training_pools = {}
+    training_pools['setting_A'] = get_training_pool_for_setting(images_by_class, 'A')
+    training_pools['setting_B'] = get_training_pool_for_setting(images_by_class, 'B')
+    training_pools['setting_C'] = get_training_pool_for_setting(images_by_class, 'C')
+    
+    print(f"  Setting A: {len(training_pools['setting_A'])} training images")
+    print(f"  Setting B: {len(training_pools['setting_B'])} training images")
+    pool1, pool2 = training_pools['setting_C']
+    print(f"  Setting C: {len(pool1)} + {len(pool2)} training images")
+    
+    target_samples = 25
+    print(f"\nTarget: {target_samples} samples per setting per norm")
+    print(f"PGD: {pgd_steps} iterations with community standard α")
+    print(f"Bézier: 30 iterations with lr=0.01")
+    print("="*80)
+    
+    all_results = {}
     
     for norm in norms:
         print(f"\n{'='*80}")
-        print(f"Testing {norm.upper()} norm with epsilon={epsilons[norm]}")
+        print(f"Testing {norm.upper()} norm (ε={epsilons[norm]})")
         print(f"{'='*80}")
         
         eps = epsilons[norm]
-        
-        # Modified: Use community standard alpha values (same as experiment_basic)
         alpha = eps / pgd_alpha_factors[norm]
         
-        # Create PGD attack with same parameters as experiment_basic
-        pgd_attack = PGDAttack(
-            model, 
-            eps=eps, 
-            alpha=alpha,
-            num_iter=pgd_steps,  # 40 iterations
-            norm=norm
+        pgd_attack = PGDAttack(model, eps=eps, alpha=alpha, 
+                              num_iter=pgd_steps, norm=norm)
+        
+        bezier = BezierAdversarialUnconstrained(model, norm=norm, eps=eps, 
+                                               lr=0.01, num_iter=30)
+        
+        norm_results = {}
+        
+        # Setting A
+        print(f"\n  Setting A (Single Image, Class {FIXED_CLASSES['setting_A']}):")
+        test_images_A, test_labels_A = test_sets['setting_A']
+        samples_A = collect_samples_setting_A(
+            training_pools['setting_A'], model, pgd_attack, bezier,
+            test_images_A, test_labels_A, target_samples
         )
+        norm_results['setting_A'] = samples_A
         
-        # Bezier with same parameters
-        bezier = BezierAdversarialUnconstrained(
-            model, 
-            norm=norm, 
-            eps=eps, 
-            lr=0.01,  # Same as experiment_basic
-            num_iter=30  # Same as multi_image
+        # Setting B
+        print(f"\n  Setting B (Same Class, Class {FIXED_CLASSES['setting_B']}):")
+        test_images_B, test_labels_B = test_sets['setting_B']
+        samples_B = collect_samples_setting_B(
+            training_pools['setting_B'], model, pgd_attack, bezier,
+            test_images_B, test_labels_B, target_samples
         )
+        norm_results['setting_B'] = samples_B
         
-        norm_results = {
-            'setting_A': [],
-            'setting_B': [],
-            'setting_C': []
-        }
-        
-        # Generation statistics
-        generation_stats = {
-            'setting_A': {'attempted': 0, 'successful': 0},
-            'setting_B': {'attempted': 0, 'successful': 0},
-            'setting_C': {'attempted': 0, 'successful': 0}
-        }
-        
-        # Modified: Changed from 3 to 5 experiments
-        num_experiments = 5  # Changed from 3 to 5 (same as experiment_basic)
-        max_attempts_per_setting = 30
-        
-        # Setting A: Single image
-        print("\n  Testing Setting A...")
-        successful_runs_A = 0
-        attempt_count_A = 0
-        
-        while successful_runs_A < num_experiments and attempt_count_A < max_attempts_per_setting:
-            attempt_count_A += 1
-            generation_stats['setting_A']['attempted'] += 1
-            
-            # Use same class selection as multi_image
-            class_a = list(images_by_class.keys())[attempt_count_A % len(images_by_class)]
-            
-            required_images = 30 + num_test_images  # 130 total
-            if len(images_by_class[class_a]) < required_images:
-                continue
-            
-            x_main = images_by_class[class_a][0][0]
-            y_main = torch.tensor([class_a]).to(device)
-            
-            # Generate valid endpoints
-            delta1, delta2, valid = generate_valid_endpoints_setting_A(
-                x_main, y_main, pgd_attack, model, max_attempts=50
-            )
-            
-            if not valid:
-                print(f"    Failed to generate valid endpoints for class {class_a}")
-                continue
-            
-            generation_stats['setting_A']['successful'] += 1
-            successful_runs_A += 1
-            
-            print(f"    Running Setting A experiment {successful_runs_A}/{num_experiments}...")
-            
-            # Optimize
-            theta_A, _, _, _ = bezier.optimize_setting_A(x_main, y_main, delta1, delta2)
-            
-            # Get test images - same as multi_image
-            test_images, test_labels = get_fixed_test_set_for_setting(
-                images_by_class, 'A', [class_a], num_test_images
-            )
-            print(f"    Using {len(test_images)} test images")
-            
-            # Evaluate
-            stats_A = evaluate_transferability(
-                model, bezier, delta1, theta_A, delta2,
-                test_images, test_labels, num_path_points=50  # Fixed 50 points
-            )
-            norm_results['setting_A'].append(stats_A)
-        
-        # Setting B: Same class
-        print("\n  Testing Setting B...")
-        successful_runs_B = 0
-        attempt_count_B = 0
-        
-        while successful_runs_B < num_experiments and attempt_count_B < max_attempts_per_setting:
-            attempt_count_B += 1
-            generation_stats['setting_B']['attempted'] += 1
-            
-            class_b = list(images_by_class.keys())[(attempt_count_B + 1) % len(images_by_class)]
-            
-            required_images = 30 + num_test_images
-            if len(images_by_class[class_b]) < required_images:
-                continue
-            
-            x1 = images_by_class[class_b][0][0]
-            x2 = images_by_class[class_b][1][0]
-            y = torch.tensor([class_b]).to(device)
-            
-            delta1, delta2, valid = generate_valid_endpoints_setting_BC(
-                x1, x2, y, y, pgd_attack, model, max_attempts=50
-            )
-            
-            if not valid:
-                continue
-            
-            generation_stats['setting_B']['successful'] += 1
-            successful_runs_B += 1
-            
-            print(f"    Running Setting B experiment {successful_runs_B}/{num_experiments}...")
-            
-            theta_B, _, _, _ = bezier.optimize_setting_B(x1, x2, y, delta1, delta2)
-            
-            test_images, test_labels = get_fixed_test_set_for_setting(
-                images_by_class, 'B', [class_b], num_test_images
-            )
-            
-            stats_B = evaluate_transferability(
-                model, bezier, delta1, theta_B, delta2,
-                test_images, test_labels, num_path_points=50
-            )
-            norm_results['setting_B'].append(stats_B)
-        
-        # Setting C: Different classes
-        print("\n  Testing Setting C...")
-        successful_runs_C = 0
-        attempt_count_C = 0
-        
-        while successful_runs_C < num_experiments and attempt_count_C < max_attempts_per_setting:
-            attempt_count_C += 1
-            generation_stats['setting_C']['attempted'] += 1
-            
-            class_ids = list(images_by_class.keys())
-            class_c1 = class_ids[(attempt_count_C + 2) % len(class_ids)]
-            class_c2 = class_ids[(attempt_count_C + 3) % len(class_ids)]
-            
-            if class_c1 == class_c2:
-                continue
-            
-            required_images = 30 + num_test_images // 2
-            if len(images_by_class[class_c1]) < required_images or len(images_by_class[class_c2]) < required_images:
-                continue
-            
-            x1 = images_by_class[class_c1][0][0]
-            x2 = images_by_class[class_c2][0][0]
-            y1 = torch.tensor([class_c1]).to(device)
-            y2 = torch.tensor([class_c2]).to(device)
-            
-            delta1, delta2, valid = generate_valid_endpoints_setting_BC(
-                x1, x2, y1, y2, pgd_attack, model, max_attempts=50
-            )
-            
-            if not valid:
-                continue
-            
-            generation_stats['setting_C']['successful'] += 1
-            successful_runs_C += 1
-            
-            print(f"    Running Setting C experiment {successful_runs_C}/{num_experiments}...")
-            
-            theta_C, _, _, _ = bezier.optimize_setting_C(x1, x2, y1, y2, delta1, delta2)
-            
-            test_images, test_labels = get_fixed_test_set_for_setting(
-                images_by_class, 'C', [class_c1, class_c2], num_test_images
-            )
-            
-            stats_C = evaluate_transferability(
-                model, bezier, delta1, theta_C, delta2,
-                test_images, test_labels, num_path_points=50
-            )
-            norm_results['setting_C'].append(stats_C)
-        
-        # Report final statistics
-        print(f"\n  {norm.upper()} Summary:")
-        print(f"    Setting A: {successful_runs_A}/{num_experiments} successful runs")
-        print(f"    Setting B: {successful_runs_B}/{num_experiments} successful runs")
-        print(f"    Setting C: {successful_runs_C}/{num_experiments} successful runs")
+        # Setting C
+        c1, c2 = FIXED_CLASSES['setting_C']
+        print(f"\n  Setting C (Different Classes, {c1} and {c2}):")
+        test_images_C, test_labels_C = test_sets['setting_C']
+        pool1, pool2 = training_pools['setting_C']
+        samples_C = collect_samples_setting_C(
+            pool1, pool2, model, pgd_attack, bezier,
+            test_images_C, test_labels_C, target_samples
+        )
+        norm_results['setting_C'] = samples_C
         
         all_results[norm] = norm_results
-        all_results['generation_stats'][norm] = generation_stats
+        
+        # Print summary
+        print(f"\n  {norm.upper()} Summary:")
+        print(f"    Setting A: {len(samples_A)} samples collected")
+        print(f"    Setting B: {len(samples_B)} samples collected")
+        print(f"    Setting C: {len(samples_C)} samples collected")
     
     return all_results
 
+def save_results(results):
+    """Save results to file"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f'bezier_transferability_reproducible_{timestamp}.json'
+    
+    # Convert to serializable format
+    results_serializable = {}
+    for norm in results:
+        results_serializable[norm] = {}
+        for setting in results[norm]:
+            samples_serializable = []
+            for sample in results[norm][setting]:
+                sample_dict = {
+                    'stats': {k: float(v) for k, v in sample['stats'].items()}
+                }
+                if 'training_idx' in sample:
+                    sample_dict['training_idx'] = int(sample['training_idx'])
+                if 'training_indices' in sample:
+                    sample_dict['training_indices'] = [int(i) for i in sample['training_indices']]
+                if 'training_image_index' in sample:
+                    sample_dict['training_image_index'] = int(sample['training_image_index'])
+                if 'training_image_indices' in sample:
+                    sample_dict['training_image_indices'] = [int(i) for i in sample['training_image_indices']]
+                samples_serializable.append(sample_dict)
+            
+            results_serializable[norm][setting] = samples_serializable
+    
+    # Add configuration
+    results_with_config = {
+        'results': results_serializable,
+        'configuration': {
+            'fixed_classes': FIXED_CLASSES,
+            'data_layout': {
+                'auxiliary_pool': '[0-24]',
+                'reserved': '[25-29]',
+                'test_set': '[30-129]',
+                'training_pool': '[130+]'
+            },
+            'target_samples': 25,
+            'test_set_size': 100,
+            'pgd_iterations': 40,
+            'bezier_iterations': 30,
+            'path_points': 50,
+            'random_seed': 42
+        }
+    }
+    
+    with open(filename, 'w') as f:
+        json.dump(results_with_config, f, indent=4)
+    
+    print(f"\nResults saved to {filename}")
+    return filename
+
 if __name__ == "__main__":
-    print("Bézier Adversarial Curves - Transferability Experiments")
-    print("Aligned with experiment_basic settings:")
-    print("- 100 test images")
-    print("- 50 path sampling points")
-    print("- Same random seeds")
-    print("- PGD with 40 iterations (same as experiment_basic)")
-    print("- Community standard α values: L∞=ε/4, L₂=ε/5, L₁=ε/10")
-    print("- 5 experiments per setting (same as experiment_basic)")
-    print("- Bézier optimization: 30 iterations with lr=0.01")
-    print("- Results in mean ± std format")
+    print("Bézier Adversarial Curves - Transferability Experiments (REPRODUCIBLE)")
+    print("="*80)
+    print("\nKey Design (Reproducible Community Standard):")
+    print("• 25 FIXED training samples per setting (deterministic selection)")
+    print("• Each sample generates its own PGD endpoints (with fixed seed)")
+    print("• Fixed test set of 100 images for evaluation")
+    print("• FULLY REPRODUCIBLE - same results every run")
+    print("\nData Layout (Aligned with other experiments):")
+    print("• [0-24]: Reserved for auxiliary (multi_image)")
+    print("• [30-129]: Fixed test set")
+    print("• [130+]: Training pool")
+    print("\nTraining Sample Selection (FIXED):")
+    print("• Setting A: Evenly spaced indices from training pool")
+    print("• Setting B: Pairs [(0,1), (2,3), ...]")
+    print("• Setting C: Cross-class pairs [(pool1[0],pool2[0]), ...]")
+    print("\nConfiguration:")
+    print("• PGD: 40 iterations with community standard α")
+    print("• Bézier: 30 iterations with lr=0.01")
+    print("• 50 path sampling points")
+    print("• Random seed: 42 (fixed)")
     print("="*80)
     
     results = run_transferability_experiments()
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f'bezier_transferability_aligned_{timestamp}.json'
-    
-    # Save results
-    with open(filename, 'w') as f:
-        json.dump(results, f, indent=4)
-    
-    print_transferability_summary(results)
-    
-    # Print generation statistics
-    print("\n" + "="*120)
-    print("ENDPOINT GENERATION STATISTICS")
-    print("="*120)
-    
-    if 'generation_stats' in results:
-        for norm in ['linf', 'l2', 'l1']:
-            if norm in results['generation_stats']:
-                print(f"\n{norm.upper()} Norm:")
-                for setting, stats in results['generation_stats'][norm].items():
-                    success_rate = stats['successful'] / stats['attempted'] if stats['attempted'] > 0 else 0
-                    print(f"  {setting}: {success_rate:.1%} success rate "
-                          f"({stats['successful']}/{stats['attempted']} attempts)")
-    
-    print(f"\nResults saved to {filename}")
-    print("\nKey features:")
-    print("1. Aligned with experiment_basic settings:")
-    print("   • PGD: 40 iterations with community standard α values")
-    print("   • 5 experiments per setting for better statistics")
-    print("2. Results displayed in mean ± std format")
-    print("3. 100 test images for better statistical reliability")
-    print("4. Fixed 50 path sampling points")
-    print("5. Complete reproducibility with seed=42")
+    if results:
+        print_transferability_results(results)
+        filename = save_results(results)
+        
+        print("\nExperimental Framework Summary:")
+        print("• experiment_basic: Tests on training images (no generalization)")
+        print("• experiment_transferability: Tests on unseen images (generalization)")
+        print("• experiment_multi_image: Tests auxiliary image effects")
+        print("• experiment_comprehensive: Tests convergence and sampling")
+        print("\nThis forms a coherent system for evaluating Bézier adversarial curves.")
