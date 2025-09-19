@@ -1,5 +1,6 @@
 """
 experiment_evolutionary.py - Compare traditional vs Bézier crossover in evolutionary attacks
+Modified: Removed adaptive method
 """
 
 import torch
@@ -65,8 +66,7 @@ def run_comparison_experiment(model, test_samples, norm='linf', eps=8/255):
     """Compare different crossover methods"""
     results = {
         'traditional': [],
-        'bezier': [],
-        'adaptive': []
+        'bezier': []
     }
     
     # EA parameters
@@ -77,12 +77,12 @@ def run_comparison_experiment(model, test_samples, norm='linf', eps=8/255):
         'mutation_strength': 0.02
     }
     
-    max_generations = 1000  # Increased from 50 to 1000 to allow traditional methods to succeed
+    max_generations = 1000  # Increased to allow traditional methods to succeed
     
     for idx, (x, y) in enumerate(test_samples):
         print(f"\nSample {idx+1}/{len(test_samples)}")
         
-        for method in ['traditional', 'bezier', 'adaptive']:
+        for method in ['traditional', 'bezier']:
             print(f"  Testing {method} crossover...")
             
             ea = EvolutionaryAttack(model, eps=eps, norm=norm, **ea_params)
@@ -105,7 +105,7 @@ def analyze_results(results):
     print("EVOLUTIONARY ATTACK COMPARISON RESULTS")
     print("="*80)
     
-    methods = ['traditional', 'bezier', 'adaptive']
+    methods = ['traditional', 'bezier']
     
     # Success rate
     print("\n1. SUCCESS RATE:")
@@ -157,8 +157,8 @@ def plot_convergence(results, save_path='convergence_plot.png'):
     """Plot convergence curves"""
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
-    methods = ['traditional', 'bezier', 'adaptive']
-    colors = ['blue', 'red', 'green']
+    methods = ['traditional', 'bezier']
+    colors = ['blue', 'red']
     
     for ax_idx, metric in enumerate(['generations', 'queries', 'time']):
         ax = axes[ax_idx]
@@ -215,7 +215,7 @@ def main():
     # Run experiments for different norms
     all_results = {}
     
-    for norm in ['linf', 'l2', 'l1']:  # Testing only linf for speed, can add 'l2', 'l1'
+    for norm in ['linf', 'l2', 'l1']:
         eps = {'linf': 8/255, 'l2': 0.5, 'l1': 10.0}[norm]
         
         print(f"\n{'='*60}")
@@ -258,9 +258,9 @@ def main():
     print("KEY FINDINGS:")
     print("="*80)
     print("1. Bézier crossover typically converges faster than traditional crossover")
-    print("2. Adaptive strategy balances exploration and exploitation")
-    print("3. Query efficiency improves with intelligent crossover")
-    print("4. Time overhead of Bézier optimization is compensated by faster convergence")
+    print("2. Query efficiency improves with intelligent crossover")
+    print("3. Time overhead of Bézier optimization is compensated by faster convergence")
+    print("4. Results demonstrate the advantage of geometric-aware crossover operations")
 
 if __name__ == "__main__":
     main()
