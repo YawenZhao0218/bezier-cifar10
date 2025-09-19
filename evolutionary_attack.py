@@ -1,6 +1,7 @@
 """
 evolutionary_attack.py - Evolutionary algorithm with traditional and Bézier crossover
 Fixed: weak initialization to show evolution progress
+Modified: Removed adaptive method
 """
 
 import torch
@@ -260,16 +261,8 @@ class EvolutionaryAttack:
                     child1, child2 = self.traditional_crossover(parents[i], parents[i+1])
                 elif crossover_type == 'bezier':
                     child1, child2 = self.bezier_crossover(parents[i], parents[i+1], x, y)
-                elif crossover_type == 'adaptive':
-                    # Use Bézier for good parents, traditional otherwise
-                    parent1_fitness = self._evaluate_single_fitness(x + parents[i], y)
-                    parent2_fitness = self._evaluate_single_fitness(x + parents[i+1], y)
-                    
-                    # If both parents have fitness > 1.5, use Bézier
-                    if parent1_fitness > 1.5 and parent2_fitness > 1.5:
-                        child1, child2 = self.bezier_crossover(parents[i], parents[i+1], x, y)
-                    else:
-                        child1, child2 = self.traditional_crossover(parents[i], parents[i+1])
+                else:
+                    raise ValueError(f"Unknown crossover type: {crossover_type}. Use 'traditional' or 'bezier'")
                 
                 child1 = self.mutate(child1)
                 child2 = self.mutate(child2)
